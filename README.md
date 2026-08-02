@@ -1,5 +1,7 @@
 # Agent Compass
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Choose how your coding agent works. Agent Compass asks one plain-language question, installs one of four supported frameworks, verifies the result, and records the project state.
 
 ## What remains in v0.5.0

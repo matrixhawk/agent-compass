@@ -267,7 +267,10 @@ def lstat_exists(path: Path) -> bool:
 
 def ensure_safe_path(root: Path, path: Path, *, for_write: bool) -> None:
     """Reject path escapes and symlink components without following target paths."""
-    root = root.resolve()
+    # Keep the lexical paths for the initial containment check and symlink walk.
+    # On macOS, resolving a path below /var produces /private/var; resolving only
+    # the root would therefore make a legitimate child appear to escape it.
+    root = root.absolute()
     absolute = path.absolute()
     try:
         relative = absolute.relative_to(root)
@@ -291,8 +294,9 @@ def ensure_safe_path(root: Path, path: Path, *, for_write: bool) -> None:
     parent = absolute.parent
     # resolve(strict=False) follows existing parents; all existing components were
     # checked above, so this is now a containment sanity check rather than trust.
+    resolved_root = root.resolve(strict=False)
     resolved_parent = parent.resolve(strict=False)
-    if resolved_parent != root and root not in resolved_parent.parents:
+    if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
         raise BootstrapError(f"目标父目录逃逸项目范围：{path}")
 
     if for_write and lstat_exists(absolute):
