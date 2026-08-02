@@ -3141,19 +3141,10 @@ def ensure_no_framework_conflicts(
     timeout: int,
     finalize: bool,
 ) -> Any | None:
-    existing = detect_existing_frameworks(root, repair=repair)
-    codex_plugins: set[str] = set()
-    inventory_holder: dict[str, Any] = {}
-    if "codex" in harnesses:
-        codex_plugins = detect_codex_plugin_frameworks(
-            root,
-            dry_run=dry_run,
-            timeout=timeout,
-            inventory_out=inventory_holder,
-        )
-        existing.update(codex_plugins)
-    conflicts = existing - {framework}
-    if conflicts:
+    def reject_conflicts(existing_frameworks: set[str]) -> None:
+        conflicts = existing_frameworks - {framework}
+        if not conflicts:
+            return
         legacy = conflicts & LEGACY_FRAMEWORKS
         suffix = (
             " 其中包含已移除的遗留框架，请先按官方方式卸载或迁移。"
@@ -3166,6 +3157,20 @@ def ensure_no_framework_conflicts(
             + "。本工具不会自动删除或混用；请先人工处理后重试。"
             + suffix
         )
+
+    existing = detect_existing_frameworks(root, repair=repair)
+    reject_conflicts(existing)
+    codex_plugins: set[str] = set()
+    inventory_holder: dict[str, Any] = {}
+    if "codex" in harnesses:
+        codex_plugins = detect_codex_plugin_frameworks(
+            root,
+            dry_run=dry_run,
+            timeout=timeout,
+            inventory_out=inventory_holder,
+        )
+        existing.update(codex_plugins)
+    reject_conflicts(existing)
     validate_integration_consistency(
         root,
         framework,

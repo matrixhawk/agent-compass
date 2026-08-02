@@ -1725,7 +1725,9 @@ class StateAndMainTests(unittest.TestCase):
                 )
 
     def test_legacy_framework_blocks_new_install(self):
-        with TempRepo() as root:
+        with TempRepo() as root, mock.patch.object(
+            module.shutil, "which", return_value=None
+        ):
             (root / ".specify").mkdir()
             with self.assertRaises(module.BootstrapError) as ctx:
                 module.main(
