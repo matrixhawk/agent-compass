@@ -21,7 +21,6 @@ The former Skill and slash-command name are retired. There is no compatibility a
 
 The bootstrapper requires Python 3.10 or newer. Project-Skills and Trellis installations require Node.js 18 or newer; OpenSpec requires Node.js 20.19 or newer.
 
-
 From the extracted directory:
 
 ```bash
