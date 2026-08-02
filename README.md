@@ -4,7 +4,7 @@
 
 Choose how your coding agent works. Agent Compass first checks whether the project warrants a framework, selects one of four supported options by user need, verifies the result, and records honest readiness state.
 
-## Frameworks in v0.6.0
+## Frameworks in v0.6.1
 
 | Need | Framework |
 |---|---|
@@ -18,6 +18,8 @@ Spec Kit, BMAD, Compound Engineering, and Ponytail were removed because their us
 ## Install Agent Compass
 
 The former Skill and slash-command name are retired. There is no compatibility alias; use only `agent-compass` and `/agent-compass`. Legacy artifacts are detected and must be handled explicitly before installation.
+
+The bootstrapper requires Python 3.10 or newer. Project-Skills and Trellis installations require Node.js 18 or newer; OpenSpec requires Node.js 20.19 or newer.
 
 
 From the extracted directory:
@@ -41,25 +43,26 @@ Replace `codex` with `claude-code`, `cursor`, or `opencode` as needed.
 Agent Compass asks:
 
 ```text
-这个项目是否需要长期维护或严格工程流程？
+Does this task meet all three conditions: one-off, low-risk,
+and no need for a strict engineering workflow?
 
-1. 否，只是短期、低风险或一次性任务
-2. 是，或者我还不确定
+1. Yes, all three conditions apply
+2. No, at least one does not apply, or I am unsure
 ```
 
-Short, low-risk work defaults to no framework. Otherwise it asks:
+Only answer 1 skips framework selection. A complex or higher-risk one-off task can still select Superpowers. Otherwise it asks:
 
 ```text
-你最想解决哪类问题？
+What is the primary need?
 
-1. 由我主导，按需调用调试、评审和 TDD Skills
-2. 每次变更先形成可评审的规格，再开始实现
-3. 跨会话接续项目规范、任务进度和设计决策
-4. 让单次复杂任务遵循严格的规划、实现和验证流程
-5. 仍然不安装任何框架
+1. Agent-led, on-demand debugging, review, and TDD skills
+2. Reviewable specifications before each implementation
+3. Project rules, task progress, and decisions across sessions
+4. A strict plan, implementation, and verification flow for one complex task
+5. Do not install a framework
 ```
 
-For choices 1–4 it then asks whether AI should default to the smallest necessary change.
+For choices 1–4 it then asks whether AI should default to the smallest necessary change. The questionnaire, operation summary, completion phase, and doctor output follow the locale; use `--language zh` or `--language en` to override it.
 
 Direct selection is also supported:
 
@@ -81,7 +84,7 @@ It is safe to combine with any retained framework and is idempotent.
 
 ### Matt Pocock Skills
 
-Installs six selected project Skills and records `pending`. Run `setup-matt-pocock-skills`, then finalize:
+Resolves one upstream commit, checks out that exact revision in a temporary directory, installs only six selected project Skills, and rewrites `skills-lock.json` with the remote source and commit. It then records `pending`. Run `setup-matt-pocock-skills`, then finalize:
 
 ```bash
 python3 skills/agent-compass/scripts/compass_bootstrap.py matt \
@@ -93,7 +96,7 @@ python3 skills/agent-compass/scripts/compass_bootstrap.py matt \
 
 ### OpenSpec
 
-Uses a resolved exact `@fission-ai/openspec` npm version, initializes selected hosts, and verifies the OpenSpec directories and generated Skills.
+Uses a resolved exact `@fission-ai/openspec` npm version, initializes selected hosts, and verifies real `openspec-*/SKILL.md` outputs with checksums. Dist-tags and version ranges are rejected when a version is supplied.
 
 ### Trellis
 
@@ -120,7 +123,21 @@ python3 skills/agent-compass/scripts/compass_bootstrap.py trellis \
 
 ### Superpowers
 
-Uses the official Codex plugin when Codex is the only selected host. Other hosts default to project-local Skills. The project-local mode is explicitly marked as a compatibility fallback and does not claim official plugin hooks.
+Uses the `superpowers@openai-curated` Codex plugin when Codex is the only selected host; a same-named plugin from a custom marketplace is not accepted as the official integration. Other hosts default to a whitelist of project-local Skills installed from one exact upstream commit with matching lock provenance. The project-local mode is explicitly marked as a compatibility fallback and does not claim official plugin hooks.
+
+When official mode is explicitly chosen for a non-Codex host, Agent Compass records `pending` until the host installation is complete and explicitly confirmed:
+
+```bash
+python3 skills/agent-compass/scripts/compass_bootstrap.py superpowers \
+  --project-root . \
+  --harness cursor \
+  --integration official \
+  --finalize \
+  --confirm-superpowers-installation \
+  --yes
+```
+
+This confirmation is recorded as user-attested because the host state cannot be machine-verified by Agent Compass.
 
 ## Read-only health check
 
@@ -129,26 +146,31 @@ Diagnose the recorded setup without modifying project or host state:
 ```bash
 python3 skills/agent-compass/scripts/compass_bootstrap.py \
   --project-root . \
-  --doctor
+  --doctor \
+  --language en
 ```
 
-The command returns 0 only for a recorded and verified `ready` setup. Missing state, legacy Trellis readiness, incomplete gates, or failed verification return 1.
+The command returns 0 only for a structurally valid, conflict-free, recorded `ready` setup whose current artifacts, checksums, plugin identities, and managed rules match state. Missing or legacy state, a repository lock, mixed frameworks, tampering, incomplete gates, or failed verification return 1. `--language` is the only non-diagnostic behavior option accepted with `--doctor`; it changes output language but never state.
 
 ## Safety properties
 
 - one primary framework per repository
 - no automatic uninstall or migration
 - legacy framework conflict detection
-- symbolic-link and path-escape rejection
+- recursive symbolic-link and path-escape rejection before upstream installers run
 - atomic writes for Agent-Compass-managed files
 - rollback of Agent-Compass-managed files on failure
-- exact version or revision recording
+- exact semver, pinned source checkout/lock revision, plugin identity, and artifact checksum recording
 - post-install verification before `ready`
 - multi-host verification
+- per-host readiness that cannot be bypassed by finalizing a host subset
 - phased Trellis readiness without false success
-- read-only health diagnosis
+- fail-closed Codex plugin conflict detection
+- repository mutation lock plus a second conflict check inside the lock
+- dry runs that report `not_installed`, never write state, and never claim successful installation
+- read-only, tamper-detecting health diagnosis
 
-State is stored in `.agent-compass.json` schema 6. Schema 5 remains readable for compatibility.
+State is stored in `.agent-compass.json` schema 7. Schemas 5 and 6 remain readable only for migration and must be finalized into schema 7 before health checks can report `ready`.
 
 ## Development
 

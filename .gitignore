@@ -1,3 +1,4 @@
 __pycache__/
 *.py[cod]
 .agent-framework.json
+.agent-compass.lock

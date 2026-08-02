@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Compass"
+  short_description: "Choose and verify one coding workflow safely"
+  default_prompt: "Use $agent-compass to choose and safely configure the right coding workflow for this repository."

@@ -1,6 +1,6 @@
 ---
 name: agent-compass
-description: Safely choose, install, initialize, diagnose, and verify one of four AI coding frameworks for the current repository. Use only when the user explicitly invokes /agent-compass, requests an Agent Compass health check, or asks to install Matt Pocock Skills, OpenSpec, Trellis, or Superpowers.
+description: Choose, install, finalize, diagnose, or repair one repository-level AI coding workflow among Matt Pocock Skills, OpenSpec, Trellis, and Superpowers. Use when a user invokes Agent Compass, asks which coding-agent framework fits a project, wants specification/TDD/project-memory workflow support, needs to avoid mixing agent frameworks, or wants an existing Agent Compass installation verified—even if they do not name Agent Compass. Also use for Chinese requests such as 选择编码 Agent 工作流、安装规格或 TDD 流程、检查框架冲突。
 ---
 
 # Agent Compass
@@ -30,16 +30,25 @@ On hosts that invoke Skills with `$`, use `$agent-compass` with the same argumen
 
 ## Automatic selection
 
-When no framework is supplied, first ask exactly:
+When no framework is supplied, use the requested language from `--language`, or the locale when it is `auto`. First ask whether all three skip conditions apply. In Chinese:
 
 ```text
-这个项目是否需要长期维护或严格工程流程？
+这个任务是否同时满足：一次性、低风险、无需严格工程流程？
 
-1. 否，只是短期、低风险或一次性任务
-2. 是，或者我还不确定
+1. 是，三项都满足
+2. 否，任一项不满足，或者我不确定
 ```
 
-Map answer 1 to `none` and stop. For answer 2, ask exactly:
+In English:
+
+```text
+Does this task meet all three conditions: one-off, low-risk, and no need for a strict engineering workflow?
+
+1. Yes, all three conditions apply
+2. No, at least one does not apply, or I am unsure
+```
+
+Map answer 1 to `none` and stop. For answer 2, ask for the primary need in the same language:
 
 ```text
 你最想解决哪类问题？
@@ -93,6 +102,8 @@ handoff
 
 Record `pending`, invoke `setup-matt-pocock-skills`, complete its repository questions, then run `matt --finalize --yes`. Report success only after `ready`.
 
+Resolve the upstream `HEAD`, fetch and detach-checkout that exact commit in a temporary directory, install from the pinned checkout, and rewrite `skills-lock.json` entries to the remote source plus that commit. Finalize and doctor must reject missing, movable, or inconsistent lock revisions.
+
 ### OpenSpec
 
 Use an exact resolved official npm version. Verify `openspec/`, `openspec/specs/`, `openspec/changes/`, and generated `openspec-*` Skills for every requested host.
@@ -118,9 +129,11 @@ Existing valid Trellis repositories may add another host without rewriting devel
 
 ### Superpowers
 
-Prefer the verifiable official Codex plugin when Codex is the only host. Otherwise default to project-local Skills unless the user requests official integration.
+Prefer the verifiable `superpowers@openai-curated` Codex plugin when Codex is the only host. Reject a same-named plugin from a custom Marketplace as the official integration. Otherwise default to project-local Skills unless the user requests official integration.
 
 Project-Skills mode is a compatibility fallback without the full host plugin's SessionStart Hook or update lifecycle. Never call it equivalent to the official plugin.
+
+For non-Codex official installations, keep each host `pending` until the user has completed the host's official installation instructions and explicitly runs `superpowers --integration official --finalize --confirm-superpowers-installation`. Record that this confirmation is user-attested rather than machine-verified.
 
 ## Health check
 
@@ -130,7 +143,7 @@ Run a read-only diagnosis with:
 python3 scripts/compass_bootstrap.py --doctor --project-root <repo-root>
 ```
 
-Do not combine `--doctor` with install, repair, minimal, finalize, or confirmation options. Do not write state or repair files. Return 0 only for a recorded, verified `ready` setup; return 1 for missing state, pending gates, legacy Trellis readiness, or failed checks.
+Do not combine `--doctor` with install, repair, minimal, finalize, confirmation, harness, integration, yes, or dry-run options. Allow `--language auto|zh|en` because it changes output only. Do not write state or repair files. Return 0 only when state is structurally valid, exactly one framework is present, managed artifacts and checksums match, host identity checks pass, and the recorded status is `ready`. Return 1 for missing state, a repository lock, pending gates, legacy readiness, conflicts, tampering, or failed checks.
 
 ## Minimal policy
 
@@ -159,6 +172,9 @@ Do not install Spec Kit, BMAD, Compound Engineering, or Ponytail. Detect their l
 6. Write `ready` only after every required gate passes; otherwise record the exact phase and next actions.
 7. Pin executable package versions or record exact revisions and checksums.
 8. Do not reimplement an upstream framework's task lifecycle inside Agent Compass.
+9. Serialize real mutations with `.agent-compass.lock` and repeat conflict detection after acquiring it.
+10. Treat Codex plugin inventory failures as blocking; never assume absence when detection fails.
+11. A dry run may describe intended commands, but must report `not_installed`, must not write state, and must not claim installation/readiness.
 
 ## Run the bootstrapper
 
@@ -176,14 +192,16 @@ Forward supplied options:
 --doctor                              read-only health check
 --harness <host>                      repeatable or comma-separated
 --integration <mode>                  auto, official, project-skills
+--language <auto|zh|en>               questionnaire, summary, and doctor language
 --minimal                             add the minimal-change policy
 --user <name>                         Trellis developer name
 --trellis-version <ver>               exact npm version
 --openspec-version <ver>              exact npm version
---repair                              allow Trellis repair
+--repair                              allow Trellis repair; Trellis install only
 --finalize                            verify pending initialization
 --confirm-trellis-activation          confirm host activation with finalize
 --confirm-trellis-bootstrap           confirm initial spec bootstrap with finalize
+--confirm-superpowers-installation    attest non-Codex official install with finalize
 --yes
 --dry-run
 --timeout <seconds>
@@ -193,14 +211,14 @@ Use `python` only when `python3` is unavailable.
 
 ## State
 
-Write `.agent-compass.json` schema 6 with:
+Write `.agent-compass.json` schema 7 with:
 
 - framework, integration, hosts, scope, and independent minimal state
-- overall status and Trellis installation/activation/bootstrap readiness
-- exact versions, source revisions, and copied Skill checksums
+- overall status, per-host readiness, and Trellis bootstrap readiness
+- exact versions, plugin identities, source revisions, and artifact checksums
 - verification results, pending actions, activation notes, and limitations
 
-Read schema 5 for compatibility. For schema 5 Trellis state, require finalize before claiming complete readiness.
+Read schemas 5 and 6 only for migration. Require finalize into schema 7 before `--doctor` can report ready; never trust legacy aggregate readiness as per-host confirmation.
 
 `none` skips the operation; it never uninstalls anything and cannot combine with `--minimal`.
 

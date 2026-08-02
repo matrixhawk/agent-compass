@@ -24,16 +24,19 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
-VERSION = "0.6.0"
-STATE_SCHEMA = 6
+VERSION = "0.6.1"
+STATE_SCHEMA = 7
+READABLE_STATE_SCHEMAS = {5, 6, STATE_SCHEMA}
 SKILLS_CLI_VERSION = "1.5.9"
 TRELLIS_PACKAGE = "@mindfoldhq/trellis"
 OPENSPEC_PACKAGE = "@fission-ai/openspec"
+CODEX_OFFICIAL_MARKETPLACE = "openai-curated"
 
 FRAMEWORKS = ("auto", "trellis", "openspec", "superpowers", "matt", "none")
 FRAMEWORK_ALIASES = {
@@ -43,8 +46,10 @@ FRAMEWORK_ALIASES = {
 FRAMEWORK_CHOICES = (*FRAMEWORKS, *FRAMEWORK_ALIASES)
 LEGACY_FRAMEWORKS = {"speckit", "bmad", "compound", "ponytail"}
 HARNESSES = ("auto", "codex", "claude-code", "cursor", "opencode")
+ACTIVE_HARNESSES = tuple(item for item in HARNESSES if item != "auto")
 INTEGRATIONS = ("auto", "official", "project-skills")
 STATE_FILE = ".agent-compass.json"
+LOCK_FILE = ".agent-compass.lock"
 RETIRED_STATE_FILE = ".agent-framework.json"
 RETIRED_MANAGED_PREFIX = "<!-- agent-framework-selector:"
 RETIRED_SKILL_NAME = "agent-framework"
@@ -53,6 +58,19 @@ MANAGED_END = "<!-- agent-compass:end -->"
 MINIMAL_START = "<!-- agent-compass:minimal:start -->"
 MINIMAL_END = "<!-- agent-compass:minimal:end -->"
 DEFAULT_TIMEOUT_SECONDS = 600
+READINESS_VALUES = {"unknown", "pending", "ready"}
+STATE_STATUSES = {
+    "pending",
+    "installed",
+    "activation_pending",
+    "bootstrap_pending",
+    "ready",
+}
+EXACT_SEMVER = re.compile(
+    r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
 
 SOURCE_REPOSITORIES = {
     "superpowers": "obra/superpowers",
@@ -178,8 +196,10 @@ class InstallOutcome:
     integration: str
     status: str = "ready"
     readiness: dict[str, str] = field(default_factory=dict)
+    host_readiness: dict[str, dict[str, str]] = field(default_factory=dict)
     created_or_managed: list[str] = field(default_factory=list)
     versions: dict[str, str] = field(default_factory=dict)
+    identities: dict[str, str] = field(default_factory=dict)
     source_revisions: dict[str, str] = field(default_factory=dict)
     checksums: dict[str, str] = field(default_factory=dict)
     verification: dict[str, bool] = field(default_factory=dict)
@@ -259,6 +279,72 @@ class ManagedFileTransaction:
         return False
 
 
+class RepositoryLock:
+    """Serialize Agent Compass mutations without making doctor write state."""
+
+    def __init__(self, root: Path, *, enabled: bool) -> None:
+        self.root = root
+        self.path = root / LOCK_FILE
+        self.enabled = enabled
+        self._acquired = False
+        self._identity: tuple[int, int] | None = None
+
+    def __enter__(self) -> "RepositoryLock":
+        if not self.enabled:
+            return self
+        ensure_safe_path(self.root, self.path, for_write=True)
+        payload = (
+            f"pid={os.getpid()}\n"
+            f"started_at={datetime.now(timezone.utc).isoformat()}\n"
+        ).encode("utf-8")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except FileExistsError as exc:
+            raise BootstrapError(
+                f"检测到 {LOCK_FILE}；另一个 Agent Compass 流程可能正在运行。"
+                "确认没有活动进程后再人工移走陈旧锁文件。"
+            ) from exc
+        except OSError as exc:
+            raise BootstrapError(f"无法创建仓库锁 {LOCK_FILE}：{exc}") from exc
+        lock_stat = os.fstat(fd)
+        self._identity = (lock_stat.st_dev, lock_stat.st_ino)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            raise
+        self._acquired = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if self._acquired:
+            try:
+                ensure_safe_path(self.root, self.path, for_write=True)
+                current = self.path.lstat()
+                current_identity = (current.st_dev, current.st_ino)
+                if current_identity != self._identity:
+                    print(
+                        f"警告：仓库锁 {LOCK_FILE} 已被替换，拒绝删除。",
+                        file=sys.stderr,
+                    )
+                    return False
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            except (BootstrapError, OSError) as lock_error:
+                print(f"警告：无法移除仓库锁：{lock_error}", file=sys.stderr)
+        return False
+
+
 def lstat_exists(path: Path) -> bool:
     try:
         path.lstat()
@@ -320,6 +406,59 @@ def safe_read_text(root: Path, path: Path) -> str:
         raise BootstrapError(f"文件不是有效 UTF-8：{path}") from exc
 
 
+def reject_symlinks_in_tree(root: Path, base: Path) -> None:
+    """Reject existing symlinks before an upstream installer can see a target."""
+    if not lstat_exists(base):
+        return
+    ensure_safe_path(root, base, for_write=False)
+    if base.is_file():
+        return
+    if not base.is_dir():
+        raise BootstrapError(f"安装目标不是普通文件或目录：{base}")
+    for path in base.rglob("*"):
+        ensure_safe_path(root, path, for_write=False)
+        if path.is_symlink():
+            raise BootstrapError(f"安装目标包含符号链接：{path}")
+
+
+def hash_file(root: Path, path: Path) -> str:
+    ensure_safe_path(root, path, for_write=False)
+    if not path.is_file() or path.is_symlink():
+        raise BootstrapError(f"无法校验非普通文件：{path}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def hash_directory(root: Path, directory: Path) -> str:
+    ensure_safe_path(root, directory, for_write=False)
+    if not directory.is_dir() or directory.is_symlink():
+        raise BootstrapError(f"无法校验非普通目录：{directory}")
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        ensure_safe_path(root, path, for_write=False)
+        if path.is_symlink():
+            raise BootstrapError(f"校验目录包含符号链接：{path}")
+        relative = path.relative_to(directory).as_posix().encode("utf-8")
+        if path.is_dir():
+            digest.update(b"D\0" + relative + b"\0")
+        elif path.is_file():
+            digest.update(b"F\0" + relative + b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        else:
+            raise BootstrapError(f"校验目录包含特殊文件：{path}")
+    return digest.hexdigest()
+
+
+def hash_verified_path(
+    root: Path, path: Path, *, expect_directory: bool
+) -> str:
+    return (
+        hash_directory(root, path)
+        if expect_directory
+        else hash_file(root, path)
+    )
+
+
 def atomic_write_bytes(root: Path, path: Path, data: bytes, *, mode: int | None = None) -> None:
     ensure_safe_path(root, path, for_write=True)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,7 +483,123 @@ def atomic_write_text(root: Path, path: Path, text: str, *, mode: int | None = N
     atomic_write_bytes(root, path, text.encode("utf-8"), mode=mode)
 
 
-def prompt_yes_no(question: str, *, default: bool = False) -> bool:
+def detect_prompt_language(requested: str = "auto") -> str:
+    if requested in {"zh", "en"}:
+        return requested
+    locale = " ".join(
+        os.environ.get(name, "")
+        for name in ("LC_ALL", "LC_MESSAGES", "LANG")
+    ).lower()
+    return "zh" if "zh" in locale else "en"
+
+
+def localized_text(language: str, zh: str, en: str) -> str:
+    return zh if detect_prompt_language(language) == "zh" else en
+
+
+OUTCOME_MESSAGE_ENGLISH = {
+    "项目 Skills 模式不包含宿主插件的 SessionStart Hook 或插件自动更新。": (
+        "Project-Skills mode does not include the host plugin's SessionStart "
+        "hook or automatic plugin updates."
+    ),
+    "如当前 Agent 尚未发现新 Skill，请开始一个新会话。": (
+        "Start a new Agent session if the current session has not discovered "
+        "the new Skills."
+    ),
+    (
+        "在当前 Agent 会话调用 `setup-matt-pocock-skills`，完成 issue tracker 和 domain docs 配置；"
+        "随后运行本脚本 `matt --finalize`。"
+    ): (
+        "Invoke `setup-matt-pocock-skills` in the current Agent session, "
+        "complete the issue-tracker and domain-docs setup, then run this "
+        "script with `matt --finalize`."
+    ),
+    "Trellis 以 AGPL-3.0 发布；企业或客户仓库使用前应确认内部合规要求。": (
+        "Trellis is distributed under AGPL-3.0; confirm internal compliance "
+        "requirements before using it in enterprise or client repositories."
+    ),
+    (
+        "在 Codex 中启用 hooks，并通过 `/hooks` 审核 Trellis Hook；"
+        "完成后使用 --finalize --confirm-trellis-activation。"
+    ): (
+        "Enable hooks in Codex and approve the Trellis hook through `/hooks`; "
+        "then use --finalize --confirm-trellis-activation."
+    ),
+    (
+        "完成 Trellis 的 00-bootstrap-guidelines，从真实代码生成首版 spec；"
+        "确认后使用 --finalize --confirm-trellis-bootstrap。"
+    ): (
+        "Complete Trellis 00-bootstrap-guidelines against the real codebase "
+        "to generate the initial spec; then use "
+        "--finalize --confirm-trellis-bootstrap."
+    ),
+    "开始新 Agent 会话后使用 OpenSpec 的 propose/apply/archive Skills。": (
+        "Start a new Agent session before using OpenSpec's "
+        "propose/apply/archive Skills."
+    ),
+    "开始一个新 Codex 会话以加载插件。": (
+        "Start a new Codex session to load the plugin."
+    ),
+    (
+        "在 Claude Code 执行 `/plugin install superpowers@claude-plugins-official`，"
+        "然后 `/reload-plugins`。"
+    ): (
+        "In Claude Code, run `/plugin install "
+        "superpowers@claude-plugins-official`, then `/reload-plugins`."
+    ),
+    "在 Cursor Agent 执行 `/add-plugin superpowers`。": (
+        "Run `/add-plugin superpowers` in Cursor Agent."
+    ),
+    "让 OpenCode 获取并严格执行 Superpowers 官方 `.opencode/INSTALL.md`。": (
+        "Have OpenCode retrieve and follow the official Superpowers "
+        "`.opencode/INSTALL.md` exactly."
+    ),
+    "非 Codex 官方插件由用户在宿主中安装；Agent Compass 只能记录显式人工确认。": (
+        "Official plugins for non-Codex hosts are installed by the user; "
+        "Agent Compass can only record explicit user confirmation."
+    ),
+    (
+        "启用 Codex hooks 并通过 `/hooks` 审批后，"
+        "使用 --finalize --confirm-trellis-activation。"
+    ): (
+        "After enabling Codex hooks and approving them through `/hooks`, "
+        "use --finalize --confirm-trellis-activation."
+    ),
+    (
+        "完成 00-bootstrap-guidelines 后，"
+        "使用 --finalize --confirm-trellis-bootstrap。"
+    ): (
+        "After completing 00-bootstrap-guidelines, use "
+        "--finalize --confirm-trellis-bootstrap."
+    ),
+    "非 Codex 官方插件状态来自用户显式确认，无法由 Agent Compass 机器验证。": (
+        "Official plugin state for non-Codex hosts is user-attested and "
+        "cannot be machine-verified by Agent Compass."
+    ),
+}
+
+
+def localized_outcome_message(message: str, language: str) -> str:
+    if detect_prompt_language(language) == "zh":
+        return message
+    translated = OUTCOME_MESSAGE_ENGLISH.get(message)
+    if translated:
+        return translated
+    match = re.fullmatch(
+        r"当前选择器无法无交互完成 Superpowers 在 (.+) 的官方安装。",
+        message,
+    )
+    if match:
+        return (
+            "This selector cannot complete the official Superpowers "
+            f"installation for {match.group(1)} non-interactively."
+        )
+    return message
+
+
+def prompt_yes_no(
+    question: str, *, default: bool = False, language: str = "zh"
+) -> bool:
     suffix = " [Y/n] " if default else " [y/N] "
     while True:
         answer = input(question + suffix).strip().lower()
@@ -354,41 +609,73 @@ def prompt_yes_no(question: str, *, default: bool = False) -> bool:
             return True
         if answer in {"n", "no", "否", "不", "取消"}:
             return False
-        print("请输入 y 或 n。")
+        print("请输入 y 或 n。" if language == "zh" else "Enter y or n.")
 
 
-def prompt_choice(question: str, options: Sequence[str]) -> int:
+def prompt_choice(
+    question: str, options: Sequence[str], *, language: str = "zh"
+) -> int:
     print(question)
     for index, option in enumerate(options, start=1):
         print(f"  {index}. {option}")
     while True:
-        answer = input("请选择编号：").strip()
+        answer = input("请选择编号：" if language == "zh" else "Choose a number: ").strip()
         if answer.isdigit() and 1 <= int(answer) <= len(options):
             return int(answer)
-        print(f"请输入 1-{len(options)}。")
+        if language == "zh":
+            print(f"请输入 1-{len(options)}。")
+        else:
+            print(f"Enter a number from 1 to {len(options)}.")
 
 
-def choose_framework_interactively() -> tuple[str, bool]:
+def choose_framework_interactively(language: str = "auto") -> tuple[str, bool]:
     """Choose one primary workflow after checking whether one is warranted."""
-    project_fit = prompt_choice(
-        "这个项目是否需要长期维护或严格工程流程？",
-        (
-            "否，只是短期、低风险或一次性任务",
-            "是，或者我还不确定",
-        ),
-    )
-    if project_fit == 1:
-        return "none", False
-
-    choice = prompt_choice(
-        "你最想解决哪类问题？",
-        (
+    language = detect_prompt_language(language)
+    if language == "zh":
+        fit_question = "这个任务是否同时满足：一次性、低风险、无需严格工程流程？"
+        fit_options = (
+            "是，三项都满足",
+            "否，任一项不满足，或者我不确定",
+        )
+        need_question = "你最想解决哪类问题？"
+        need_options = (
             "由我主导，按需调用调试、评审和 TDD Skills",
             "每次变更先形成可评审的规格，再开始实现",
             "跨会话接续项目规范、任务进度和设计决策",
             "让单次复杂任务遵循严格的规划、实现和验证流程",
             "仍然不安装任何框架",
-        ),
+        )
+        minimal_question = "是否默认要求 AI 只做最小必要修改？"
+    else:
+        fit_question = (
+            "Does this task meet all three conditions: one-off, low-risk, "
+            "and no need for a strict engineering workflow?"
+        )
+        fit_options = (
+            "Yes, all three conditions apply",
+            "No, at least one does not apply, or I am unsure",
+        )
+        need_question = "What is the primary need?"
+        need_options = (
+            "Agent-led, on-demand debugging, review, and TDD skills",
+            "Reviewable specifications before each implementation",
+            "Project rules, task progress, and decisions across sessions",
+            "A strict plan, implementation, and verification flow for one complex task",
+            "Do not install a framework",
+        )
+        minimal_question = "Should the AI default to the smallest necessary change?"
+    project_fit = prompt_choice(
+        fit_question,
+        fit_options,
+        language=language,
+    )
+    if project_fit == 1:
+        return "none", False
+
+    choice = prompt_choice(
+        need_question,
+        need_options,
+        language=language,
     )
     framework = {
         1: "matt",
@@ -400,15 +687,30 @@ def choose_framework_interactively() -> tuple[str, bool]:
     minimal = False
     if framework != "none":
         minimal = prompt_yes_no(
-            "是否默认要求 AI 只做最小必要修改？",
+            minimal_question,
             default=False,
+            language=language,
         )
     return framework, minimal
 
 
 def trellis_status_from_readiness(readiness: Mapping[str, str]) -> str:
-    activation = readiness.get("activation", "unknown")
-    bootstrap = readiness.get("bootstrap", "unknown")
+    normalized = {
+        key: str(readiness.get(key, "unknown"))
+        for key in ("installation", "activation", "bootstrap")
+    }
+    invalid = {
+        f"{key}={value}"
+        for key, value in normalized.items()
+        if value not in READINESS_VALUES
+    }
+    if invalid:
+        raise BootstrapError("非法 Trellis readiness：" + ", ".join(sorted(invalid)))
+    installation = normalized["installation"]
+    activation = normalized["activation"]
+    bootstrap = normalized["bootstrap"]
+    if installation != "ready":
+        return "installed"
     if activation == "pending":
         return "activation_pending"
     if bootstrap == "pending":
@@ -421,10 +723,34 @@ def trellis_status_from_readiness(readiness: Mapping[str, str]) -> str:
 def set_trellis_readiness(
     outcome: InstallOutcome,
     *,
-    activation: str,
+    host_activation: Mapping[str, str],
     bootstrap: str,
 ) -> None:
     """Set Trellis readiness without collapsing unverifiable user actions."""
+    if bootstrap not in READINESS_VALUES:
+        raise BootstrapError(f"非法 Trellis bootstrap readiness：{bootstrap}")
+    normalized_hosts: dict[str, dict[str, str]] = {}
+    for harness, activation in host_activation.items():
+        if harness not in ACTIVE_HARNESSES:
+            raise BootstrapError(f"非法 Trellis host readiness：{harness}")
+        if activation not in READINESS_VALUES:
+            raise BootstrapError(
+                f"非法 Trellis activation readiness：{harness}={activation}"
+            )
+        normalized_hosts[harness] = {
+            "installation": "ready",
+            "activation": activation,
+        }
+    activation_values = {
+        value["activation"] for value in normalized_hosts.values()
+    }
+    if "pending" in activation_values:
+        activation = "pending"
+    elif "unknown" in activation_values or not activation_values:
+        activation = "unknown"
+    else:
+        activation = "ready"
+    outcome.host_readiness = normalized_hosts
     outcome.readiness = {
         "installation": "ready",
         "activation": activation,
@@ -469,7 +795,12 @@ def detect_harness(root: Path) -> str | None:
     return found[0] if len(found) == 1 else None
 
 
-def normalize_harnesses(raw_values: Sequence[str] | None, root: Path) -> list[str]:
+def normalize_harnesses(
+    raw_values: Sequence[str] | None,
+    root: Path,
+    *,
+    language: str = "auto",
+) -> list[str]:
     values: list[str] = []
     for raw in raw_values or ["auto"]:
         values.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -481,12 +812,13 @@ def normalize_harnesses(raw_values: Sequence[str] | None, root: Path) -> list[st
             raise BootstrapError(
                 "无法自动识别 Agent，请传入 --harness codex|claude-code|cursor|opencode。"
             )
-        print("选择 Agent：1) codex  2) claude-code  3) cursor  4) opencode")
-        mapping = {"1": "codex", "2": "claude-code", "3": "cursor", "4": "opencode"}
-        selected = mapping.get(input("编号：").strip())
-        if not selected:
-            raise BootstrapError("未选择有效 Agent。")
-        return [selected]
+        language = detect_prompt_language(language)
+        choice = prompt_choice(
+            "选择 Agent：" if language == "zh" else "Choose an Agent:",
+            ACTIVE_HARNESSES,
+            language=language,
+        )
+        return [ACTIVE_HARNESSES[choice - 1]]
 
     if "auto" in values:
         raise BootstrapError("--harness auto 不能和其他 Agent 同时使用。")
@@ -594,8 +926,8 @@ def ensure_node_version(
             raise BootstrapError(
                 f"需要 Node.js >= {required}，当前为：{result.stdout.strip()}"
             )
-    if sys.version_info < (3, 9):
-        raise BootstrapError(f"需要 Python >= 3.9，当前为：{sys.version.split()[0]}")
+    if sys.version_info < (3, 10):
+        raise BootstrapError(f"需要 Python >= 3.10，当前为：{sys.version.split()[0]}")
 
 
 def ensure_node_18(root: Path, *, dry_run: bool, timeout: int) -> None:
@@ -653,6 +985,9 @@ def reject_retired_name_traces(root: Path) -> None:
         root / "skills" / RETIRED_SKILL_NAME,
         root / ".agents/skills" / RETIRED_SKILL_NAME,
         root / ".claude/skills" / RETIRED_SKILL_NAME,
+        root / ".codex/skills" / RETIRED_SKILL_NAME,
+        root / ".cursor/skills" / RETIRED_SKILL_NAME,
+        root / ".opencode/skills" / RETIRED_SKILL_NAME,
     }
     for path in retired_skill_paths:
         if not lstat_exists(path):
@@ -678,6 +1013,159 @@ def load_state(root: Path) -> dict[str, Any] | None:
     if not isinstance(state, dict):
         raise BootstrapError(f"{STATE_FILE} 顶层必须是 JSON 对象。")
     return state
+
+
+def validate_recorded_state(
+    state: Mapping[str, Any], *, require_current_schema: bool
+) -> tuple[str, str, list[str]]:
+    schema = state.get("schema")
+    if not isinstance(schema, int) or schema not in READABLE_STATE_SCHEMAS:
+        raise BootstrapError(f"状态文件 schema 不受支持：{schema!r}")
+    if require_current_schema and schema != STATE_SCHEMA:
+        raise BootstrapError(
+            f"状态文件 schema {schema} 需要重新 finalize 为 schema {STATE_SCHEMA}。"
+        )
+
+    framework = canonical_framework(str(state.get("framework") or ""))
+    integration = str(state.get("integration") or "")
+    valid_integrations = {
+        "trellis": {"official"},
+        "openspec": {"official"},
+        "matt": {"project-skills"},
+        "superpowers": {"official", "project-skills"},
+    }
+    if framework not in valid_integrations:
+        raise BootstrapError("状态文件中的 framework 无效。")
+    if integration not in valid_integrations[framework]:
+        raise BootstrapError(
+            f"状态文件中的集成组合无效：{framework}/{integration}。"
+        )
+
+    raw_harnesses = state.get("harnesses")
+    if not isinstance(raw_harnesses, list) or not raw_harnesses:
+        raise BootstrapError("状态文件没有有效的 harnesses。")
+    if any(not isinstance(item, str) for item in raw_harnesses):
+        raise BootstrapError("状态文件 harnesses 必须全部是字符串。")
+    harnesses = list(dict.fromkeys(raw_harnesses))
+    invalid = sorted(set(harnesses) - set(ACTIVE_HARNESSES))
+    if invalid or len(harnesses) != len(raw_harnesses):
+        detail = ", ".join(invalid) if invalid else "存在重复项"
+        raise BootstrapError("状态文件包含无效 harnesses：" + detail)
+
+    status = str(state.get("status") or "")
+    if status not in STATE_STATUSES:
+        raise BootstrapError(f"状态文件中的 status 无效：{status!r}")
+
+    if schema == STATE_SCHEMA:
+        readiness = state.get("readiness", {})
+        if not isinstance(readiness, Mapping):
+            raise BootstrapError("状态文件 readiness 必须是对象。")
+        for key, value in readiness.items():
+            if not isinstance(key, str) or str(value) not in READINESS_VALUES:
+                raise BootstrapError(f"状态文件 readiness 无效：{key}={value}")
+        host_readiness = state.get("host_readiness", {})
+        if not isinstance(host_readiness, Mapping):
+            raise BootstrapError("状态文件 host_readiness 必须是对象。")
+        for host, values in host_readiness.items():
+            if host not in ACTIVE_HARNESSES or not isinstance(values, Mapping):
+                raise BootstrapError(f"状态文件 host_readiness 无效：{host}")
+            for key, value in values.items():
+                if not isinstance(key, str) or str(value) not in READINESS_VALUES:
+                    raise BootstrapError(
+                        f"状态文件 host_readiness 无效：{host}.{key}={value}"
+                    )
+        if framework == "trellis" and set(host_readiness) != set(harnesses):
+            raise BootstrapError("Trellis host_readiness 与 harnesses 不一致。")
+        if framework == "superpowers" and integration == "official" and set(
+            host_readiness
+        ) != set(harnesses):
+            raise BootstrapError("Superpowers host_readiness 与 harnesses 不一致。")
+
+        phased = framework == "trellis" or (
+            framework == "superpowers" and integration == "official"
+        )
+        if phased:
+            expected_readiness_keys = (
+                {"installation", "activation", "bootstrap"}
+                if framework == "trellis"
+                else {"installation", "activation"}
+            )
+            if set(readiness) != expected_readiness_keys:
+                raise BootstrapError(
+                    f"{framework} readiness 字段不完整。"
+                )
+            for host, values in host_readiness.items():
+                if set(values) != {"installation", "activation"}:
+                    raise BootstrapError(
+                        f"{framework} host_readiness 字段不完整：{host}"
+                    )
+            expected_installation = aggregate_host_readiness(
+                host_readiness, "installation"
+            )
+            expected_activation = aggregate_host_readiness(
+                host_readiness, "activation"
+            )
+            if (
+                readiness.get("installation") != expected_installation
+                or readiness.get("activation") != expected_activation
+            ):
+                raise BootstrapError(
+                    f"{framework} 总体 readiness 与逐宿主状态不一致。"
+                )
+            expected_status = (
+                trellis_status_from_readiness(readiness)
+                if framework == "trellis"
+                else (
+                    "ready"
+                    if expected_installation == "ready"
+                    and expected_activation == "ready"
+                    else "pending"
+                )
+            )
+            if status != expected_status:
+                raise BootstrapError(
+                    f"{framework} status 与 readiness 不一致。"
+                )
+        elif readiness or host_readiness:
+            raise BootstrapError(
+                f"{framework}/{integration} 不应包含分阶段 readiness。"
+            )
+
+        if (
+            framework == "openspec"
+            or framework == "superpowers" and integration == "project-skills"
+        ) and status != "ready":
+            raise BootstrapError(f"{framework}/{integration} status 无效。")
+        if framework == "matt" and status not in {"pending", "ready"}:
+            raise BootstrapError("Matt status 无效。")
+        if not isinstance(state.get("minimal"), bool):
+            raise BootstrapError("状态文件 minimal 必须是布尔值。")
+        for key in ("versions", "identities", "source_revisions", "checksums"):
+            value = state.get(key, {})
+            if not isinstance(value, Mapping) or any(
+                not isinstance(item_key, str) or not isinstance(item_value, str)
+                for item_key, item_value in value.items()
+            ):
+                raise BootstrapError(f"状态文件 {key} 必须是字符串映射。")
+        verification = state.get("verification", {})
+        if not isinstance(verification, Mapping) or any(
+            not isinstance(item_key, str) or not isinstance(item_value, bool)
+            for item_key, item_value in verification.items()
+        ):
+            raise BootstrapError("状态文件 verification 必须是布尔映射。")
+        for key in (
+            "created_or_managed",
+            "pending_actions",
+            "activation_notes",
+            "limitations",
+        ):
+            value = state.get(key, [])
+            if not isinstance(value, list) or any(
+                not isinstance(item, str) for item in value
+            ):
+                raise BootstrapError(f"状态文件 {key} 必须是字符串列表。")
+
+    return framework, integration, harnesses
 
 
 def trellis_core_valid(root: Path) -> bool:
@@ -744,6 +1232,38 @@ def detect_managed_instruction_frameworks(root: Path) -> set[str]:
     }
 
 
+def detect_project_skill_frameworks(root: Path) -> set[str]:
+    """Detect only complete, distinctive framework Skill sets."""
+    found: set[str] = set()
+    roots = {
+        root / ".agents/skills",
+        root / ".claude/skills",
+        root / ".codex/skills",
+        root / ".cursor/skills",
+        root / ".opencode/skills",
+    }
+    for base in roots:
+        if not lstat_exists(base):
+            continue
+        ensure_safe_path(root, base, for_write=False)
+        if not base.is_dir() or base.is_symlink():
+            raise BootstrapError(f"Skill 根路径不是安全目录：{base.relative_to(root)}")
+        for framework, skills in EXPECTED_SKILLS.items():
+            complete = True
+            for skill in skills:
+                path = base / skill / "SKILL.md"
+                if not lstat_exists(path):
+                    complete = False
+                    break
+                ensure_safe_path(root, path, for_write=False)
+                if not path.is_file() or path.is_symlink():
+                    complete = False
+                    break
+            if complete:
+                found.add(framework)
+    return found
+
+
 
 
 
@@ -751,11 +1271,10 @@ def detect_existing_frameworks(root: Path, *, repair: bool = False) -> set[str]:
     found: set[str] = set()
     state = load_state(root)
     if state:
-        framework = canonical_framework(str(state.get("framework") or ""))
-        if framework in FRAMEWORKS and framework not in {"auto", "none"}:
-            found.add(framework)
-        elif framework in LEGACY_FRAMEWORKS:
-            found.add(framework)
+        framework, _, _ = validate_recorded_state(
+            state, require_current_schema=False
+        )
+        found.add(framework)
 
     trellis_path = root / ".trellis"
     if lstat_exists(trellis_path):
@@ -806,6 +1325,7 @@ def detect_existing_frameworks(root: Path, *, repair: bool = False) -> set[str]:
 
     found.update(detect_frameworks_from_lock(root))
     found.update(detect_managed_instruction_frameworks(root))
+    found.update(detect_project_skill_frameworks(root))
     return found
 
 
@@ -859,7 +1379,8 @@ def write_managed_instruction(
         else:
             separator = "\n\n" if current.strip() else ""
             updated = current.rstrip() + separator + block + "\n"
-        print(f"write {path.relative_to(root)}")
+        action = "would write" if dry_run else "write"
+        print(f"{action} {path.relative_to(root)}")
         if not dry_run:
             transaction.snapshot(path)
             mode = stat.S_IMODE(path.lstat().st_mode) if lstat_exists(path) else 0o644
@@ -901,13 +1422,35 @@ def write_minimal_instruction(
         else:
             separator = "\n\n" if current.strip() else ""
             updated = current.rstrip() + separator + block + "\n"
-        print(f"write {path.relative_to(root)} (minimal)")
+        action = "would write" if dry_run else "write"
+        print(f"{action} {path.relative_to(root)} (minimal)")
         if not dry_run:
             transaction.snapshot(path)
             mode = stat.S_IMODE(path.lstat().st_mode) if lstat_exists(path) else 0o644
             atomic_write_text(root, path, updated, mode=mode)
         written.append(str(path.relative_to(root)))
     return written
+
+
+def verify_minimal_policy(root: Path, harnesses: Sequence[str]) -> bool:
+    expected = minimal_block()
+    for path in instruction_files(root, harnesses):
+        if not lstat_exists(path) or expected not in safe_read_text(root, path):
+            return False
+    return True
+
+
+def verify_framework_instruction(
+    root: Path,
+    harnesses: Sequence[str],
+    framework: str,
+    integration: str,
+) -> bool:
+    expected = managed_block(framework, integration)
+    for path in instruction_files(root, harnesses):
+        if not lstat_exists(path) or expected not in safe_read_text(root, path):
+            return False
+    return True
 
 
 
@@ -920,13 +1463,15 @@ def resolve_npm_version(
     timeout: int,
 ) -> str:
     if requested:
-        if not re.fullmatch(r"[0-9A-Za-z.+_-]+", requested):
-            raise BootstrapError(f"非法 npm 版本：{requested}")
+        if not EXACT_SEMVER.fullmatch(requested):
+            raise BootstrapError(
+                f"npm 版本必须是准确 semver，不能使用 dist-tag 或范围：{requested}"
+            )
         return requested
     if dry_run:
         return "<resolved-version>"
     data = run_json(("npm", "view", package, "version", "--json"), cwd=root, dry_run=False, timeout=timeout)
-    if not isinstance(data, str) or not data.strip():
+    if not isinstance(data, str) or not EXACT_SEMVER.fullmatch(data.strip()):
         raise BootstrapError(f"无法解析 {package} 的版本。")
     return data.strip()
 
@@ -948,6 +1493,147 @@ def resolve_repository_head(
     if not first or not re.fullmatch(r"[0-9a-fA-F]{40}", first[0]):
         raise BootstrapError(f"无法解析 {source} 的提交哈希。")
     return first[0].lower()
+
+
+@contextmanager
+def pinned_repository_checkout(
+    root: Path,
+    source: str,
+    revision: str,
+    *,
+    timeout: int,
+) -> Iterator[Path]:
+    """Yield a temporary checkout whose HEAD is the exact recorded revision."""
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise BootstrapError(f"无法检出非精确提交：{revision}")
+    require_executable("git")
+    url = f"https://github.com/{source}.git"
+    with tempfile.TemporaryDirectory(
+        prefix="agent-compass-source-"
+    ) as temp_name:
+        checkout = Path(temp_name) / "source"
+        run(
+            ("git", "init", "--quiet", str(checkout)),
+            cwd=root,
+            dry_run=False,
+            timeout=timeout,
+        )
+        run(
+            (
+                "git",
+                "-C",
+                str(checkout),
+                "fetch",
+                "--quiet",
+                "--depth",
+                "1",
+                url,
+                revision,
+            ),
+            cwd=root,
+            dry_run=False,
+            timeout=timeout,
+        )
+        run(
+            (
+                "git",
+                "-C",
+                str(checkout),
+                "checkout",
+                "--quiet",
+                "--detach",
+                "FETCH_HEAD",
+            ),
+            cwd=root,
+            dry_run=False,
+            timeout=timeout,
+        )
+        actual = run(
+            ("git", "-C", str(checkout), "rev-parse", "HEAD"),
+            cwd=root,
+            dry_run=False,
+            timeout=timeout,
+            echo_output=False,
+        ).stdout.strip().lower()
+        if actual != revision:
+            raise BootstrapError(
+                f"上游检出提交不一致：期望 {revision}，实际 {actual}"
+            )
+        yield checkout
+
+
+def read_project_skills_lock(root: Path) -> tuple[Path, dict[str, Any]]:
+    path = root / "skills-lock.json"
+    if not lstat_exists(path):
+        raise BootstrapError("skills 安装后未生成 skills-lock.json。")
+    try:
+        data = json.loads(safe_read_text(root, path))
+    except json.JSONDecodeError as exc:
+        raise BootstrapError("skills 安装后生成了无效锁文件。") from exc
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != 1
+        or not isinstance(data.get("skills"), dict)
+    ):
+        raise BootstrapError("skills-lock.json 格式与 skills@1.5.9 不兼容。")
+    return path, data
+
+
+def rewrite_project_skills_lock(
+    root: Path,
+    framework: str,
+    revision: str,
+) -> None:
+    """Replace temporary-local provenance with the exact remote revision."""
+    path, data = read_project_skills_lock(root)
+    source = SOURCE_REPOSITORIES[framework]
+    for skill in EXPECTED_SKILLS[framework]:
+        entry = data["skills"].get(skill)
+        if not isinstance(entry, dict):
+            raise BootstrapError(f"skills-lock.json 缺少条目：{skill}")
+        entry["source"] = source
+        entry["sourceType"] = "github"
+        entry["ref"] = revision
+    atomic_write_text(
+        root,
+        path,
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        mode=stat.S_IMODE(path.lstat().st_mode),
+    )
+    verified = json.loads(safe_read_text(root, path))
+    if any(
+        verified["skills"][skill].get("source") != source
+        or verified["skills"][skill].get("ref") != revision
+        for skill in EXPECTED_SKILLS[framework]
+    ):
+        raise BootstrapError("skills-lock.json 精确来源写入后验证失败。")
+
+
+def verify_project_skills_lock_provenance(
+    root: Path,
+    framework: str,
+) -> str:
+    """Return the one exact revision shared by all selected Skill entries."""
+    _, data = read_project_skills_lock(root)
+    source = SOURCE_REPOSITORIES[framework]
+    revisions: set[str] = set()
+    for skill in EXPECTED_SKILLS[framework]:
+        entry = data["skills"].get(skill)
+        if not isinstance(entry, dict):
+            raise BootstrapError(f"skills-lock.json 缺少条目：{skill}")
+        revision = str(entry.get("ref") or "").lower()
+        if (
+            entry.get("source") != source
+            or entry.get("sourceType") != "github"
+            or not re.fullmatch(r"[0-9a-f]{40}", revision)
+        ):
+            raise BootstrapError(
+                f"skills-lock.json 来源未精确固定：{skill}"
+            )
+        revisions.add(revision)
+    if len(revisions) != 1:
+        raise BootstrapError("skills-lock.json 中同一框架的提交不一致。")
+    return revisions.pop()
 
 
 def skills_command(source: str | Path, skills: Iterable[str], harnesses: Sequence[str]) -> list[str]:
@@ -979,9 +1665,7 @@ def protect_installer_targets(
         if lstat_exists(skill_root):
             if not skill_root.is_dir():
                 raise BootstrapError(f"Skill 根路径不是目录：{skill_root}")
-            for child in skill_root.iterdir():
-                if child.is_symlink():
-                    raise BootstrapError(f"Skill 根目录含符号链接，拒绝交给上游安装器：{child}")
+            reject_symlinks_in_tree(root, skill_root)
         for skill in EXPECTED_SKILLS[framework]:
             ensure_safe_path(root, skill_root / skill, for_write=True)
     ensure_safe_path(root, root / "skills-lock.json", for_write=True)
@@ -997,18 +1681,7 @@ def skill_file_at(root: Path, base: Path, skill: str) -> Path | None:
 
 
 def hash_skill_directory(root: Path, skill_file: Path) -> str:
-    directory = skill_file.parent
-    digest = hashlib.sha256()
-    for path in sorted(directory.rglob("*")):
-        ensure_safe_path(root, path, for_write=False)
-        if path.is_symlink():
-            raise BootstrapError(f"安装结果包含符号链接，拒绝信任：{path}")
-        if path.is_file():
-            relative = path.relative_to(directory).as_posix().encode("utf-8")
-            digest.update(relative + b"\0")
-            digest.update(path.read_bytes())
-            digest.update(b"\0")
-    return digest.hexdigest()
+    return hash_directory(root, skill_file.parent)
 
 
 def verify_project_skills(
@@ -1058,20 +1731,43 @@ def install_project_skills(
 ) -> InstallOutcome:
     ensure_node_18(root, dry_run=dry_run, timeout=timeout)
     protect_installer_targets(root, harnesses, framework)
-    skills = ("*",) if framework == "superpowers" else EXPECTED_SKILLS[framework]
+    skills = EXPECTED_SKILLS[framework]
     outcome = InstallOutcome(framework=framework, integration="project-skills")
     revision = resolve_repository_head(
         root, SOURCE_REPOSITORIES[framework], dry_run=dry_run, timeout=timeout
     )
     outcome.source_revisions[SOURCE_REPOSITORIES[framework]] = revision
+    lock_path = root / "skills-lock.json"
+    if not dry_run:
+        transaction.snapshot(lock_path)
     mutation_tracker.mark(dry_run=dry_run)
-    run(
-        skills_command(SOURCE_REPOSITORIES[framework], skills, harnesses),
-        cwd=root,
-        dry_run=dry_run,
-        timeout=timeout,
-        env={"DISABLE_TELEMETRY": "1", "DO_NOT_TRACK": "1"},
-    )
+    if dry_run:
+        run(
+            skills_command(
+                f"{SOURCE_REPOSITORIES[framework]}#{revision}",
+                skills,
+                harnesses,
+            ),
+            cwd=root,
+            dry_run=True,
+            timeout=timeout,
+            env={"DISABLE_TELEMETRY": "1", "DO_NOT_TRACK": "1"},
+        )
+    else:
+        with pinned_repository_checkout(
+            root,
+            SOURCE_REPOSITORIES[framework],
+            revision,
+            timeout=timeout,
+        ) as checkout:
+            run(
+                skills_command(checkout, skills, harnesses),
+                cwd=root,
+                dry_run=False,
+                timeout=timeout,
+                env={"DISABLE_TELEMETRY": "1", "DO_NOT_TRACK": "1"},
+            )
+        rewrite_project_skills_lock(root, framework, revision)
     outcome.external_commands_ran = not dry_run
     verification, checksums, created = verify_project_skills(
         root, framework, harnesses, dry_run=dry_run
@@ -1091,10 +1787,14 @@ def install_project_skills(
             transaction=transaction,
         )
         outcome.created_or_managed.extend(managed)
+        outcome.verification["framework-instruction"] = True
         outcome.limitations.append(
             "项目 Skills 模式不包含宿主插件的 SessionStart Hook 或插件自动更新。"
         )
-        outcome.activation_notes.append("如当前 Agent 尚未发现新 Skill，请开始一个新会话。")
+        if not dry_run:
+            outcome.activation_notes.append(
+                "如当前 Agent 尚未发现新 Skill，请开始一个新会话。"
+            )
     elif framework == "matt":
         outcome.status = "pending"
         outcome.pending_actions.append(
@@ -1106,23 +1806,68 @@ def install_project_skills(
     return outcome
 
 
-def verify_matt_setup(root: Path) -> dict[str, bool]:
+def meaningful_markdown(root: Path, path: Path) -> bool:
+    if not lstat_exists(path):
+        return False
+    text = safe_read_text(root, path).strip()
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 40 or not re.search(r"(?m)^#{1,6}\s+\S", text):
+        return False
+    return text.lower() not in {"ok", "todo", "tbd", "placeholder"}
+
+
+def agent_skills_section(root: Path, path: Path) -> str | None:
+    if not lstat_exists(path):
+        return None
+    text = safe_read_text(root, path)
+    match = re.search(
+        r"(?ms)^## Agent skills\s*\n(?P<body>.*?)(?=^##\s|\Z)",
+        text,
+    )
+    if not match:
+        return None
+    body = match.group("body").strip()
+    return body if len(re.sub(r"\s+", "", body)) >= 40 else None
+
+
+def verify_matt_setup(
+    root: Path, harnesses: Sequence[str]
+) -> dict[str, bool]:
     required = {
         "docs/agents/issue-tracker.md": root / "docs/agents/issue-tracker.md",
         "docs/agents/domain.md": root / "docs/agents/domain.md",
     }
     result: dict[str, bool] = {}
     for name, path in required.items():
-        if lstat_exists(path):
-            ensure_safe_path(root, path, for_write=False)
-        result[name] = lstat_exists(path) and path.is_file() and not path.is_symlink()
-    instruction_candidates = [root / "CLAUDE.md", root / "AGENTS.md"]
-    result["instruction:Agent skills"] = False
-    for path in instruction_candidates:
-        if lstat_exists(path) and "## Agent skills" in safe_read_text(root, path):
-            result["instruction:Agent skills"] = True
-            break
+        result[name] = meaningful_markdown(root, path)
+    for path in instruction_files(root, harnesses):
+        key = f"instruction:{path.relative_to(root)}:Agent skills"
+        result[key] = agent_skills_section(root, path) is not None
     return result
+
+
+def matt_setup_checksums(
+    root: Path, harnesses: Sequence[str]
+) -> dict[str, str]:
+    checksums = {
+        "setup:docs/agents/issue-tracker.md": hash_file(
+            root, root / "docs/agents/issue-tracker.md"
+        ),
+        "setup:docs/agents/domain.md": hash_file(
+            root, root / "docs/agents/domain.md"
+        ),
+    }
+    for path in instruction_files(root, harnesses):
+        section = agent_skills_section(root, path)
+        if section is None:
+            raise BootstrapError(
+                f"{path.relative_to(root)} 缺少实质 Agent skills 指令。"
+            )
+        key = f"setup:instruction:{path.relative_to(root)}:Agent skills"
+        checksums[key] = hashlib.sha256(
+            section.encode("utf-8")
+        ).hexdigest()
+    return checksums
 
 
 def verify_path_kind(root: Path, path: Path, *, expect_directory: bool) -> bool:
@@ -1145,6 +1890,7 @@ def protect_trellis_targets(root: Path, harnesses: Sequence[str]) -> None:
         targets.extend(root / relative for relative in TRELLIS_PLATFORM_PATHS[harness])
     for target in targets:
         ensure_safe_path(root, target, for_write=True)
+        reject_symlinks_in_tree(root, target)
 
 
 def install_trellis(
@@ -1157,6 +1903,7 @@ def install_trellis(
     dry_run: bool,
     timeout: int,
     mutation_tracker: MutationTracker,
+    language: str = "auto",
 ) -> InstallOutcome:
     ensure_node_18(root, dry_run=dry_run, timeout=timeout)
     require_executable("git")
@@ -1177,7 +1924,13 @@ def install_trellis(
         if not developer:
             if not sys.stdin.isatty():
                 raise BootstrapError("无法确定 Trellis 开发者名称，请传入 --user。")
-            developer = input("Trellis 开发者名称：").strip()
+            developer = input(
+                localized_text(
+                    language,
+                    "Trellis 开发者名称：",
+                    "Trellis developer name: ",
+                )
+            ).strip()
         if not developer:
             raise BootstrapError("Trellis 开发者名称不能为空。")
 
@@ -1230,16 +1983,22 @@ def install_trellis(
         if not ok:
             kind = "目录" if expect_directory else "文件"
             raise BootstrapError(f"Trellis 初始化后缺少预期{kind}：{name}")
+        outcome.checksums[name] = hash_verified_path(
+            root, path, expect_directory=expect_directory
+        )
     outcome.created_or_managed.extend(sorted(required))
     outcome.limitations.append("Trellis 以 AGPL-3.0 发布；企业或客户仓库使用前应确认内部合规要求。")
-    activation = "pending" if "codex" in harnesses else "ready"
+    host_activation = {
+        harness: "pending" if harness == "codex" else "ready"
+        for harness in harnesses
+    }
     bootstrap = "pending" if not existing_valid else "unknown"
     set_trellis_readiness(
         outcome,
-        activation=activation,
+        host_activation=host_activation,
         bootstrap=bootstrap,
     )
-    if activation == "pending":
+    if host_activation.get("codex") == "pending":
         outcome.pending_actions.append(
             "在 Codex 中启用 hooks，并通过 `/hooks` 审核 Trellis Hook；"
             "完成后使用 --finalize --confirm-trellis-activation。"
@@ -1253,25 +2012,84 @@ def install_trellis(
 
 
 
-def safe_recursive_contains(root: Path, base: Path, token: str) -> bool:
-    if not lstat_exists(base):
+def verify_generated_skill_document(
+    root: Path, skill_file: Path, expected_name: str
+) -> bool:
+    text = safe_read_text(root, skill_file)
+    match = re.match(
+        r"\A---\s*\n(?P<frontmatter>.*?)\n---\s*\n(?P<body>.*)\Z",
+        text,
+        re.DOTALL,
+    )
+    if not match:
         return False
-    ensure_safe_path(root, base, for_write=False)
-    if not base.is_dir() or base.is_symlink():
-        return False
-    token = token.lower()
-    for path in base.rglob("*"):
-        ensure_safe_path(root, path, for_write=False)
-        if path.is_symlink():
-            raise BootstrapError(f"安装结果包含符号链接，拒绝信任：{path}")
-        if token in path.name.lower() and (path.is_file() or path.is_dir()):
-            return True
-    return False
+    fields: dict[str, str] = {}
+    for line in match.group("frontmatter").splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip().strip("\"'")
+    description = fields.get("description", "")
+    body = re.sub(r"\s+", "", match.group("body"))
+    return (
+        fields.get("name") == expected_name
+        and len(description) >= 20
+        and len(body) >= 40
+    )
+
+
+def verify_openspec_skills(
+    root: Path, harnesses: Sequence[str], *, dry_run: bool
+) -> tuple[dict[str, bool], dict[str, str], list[str]]:
+    verification: dict[str, bool] = {}
+    checksums: dict[str, str] = {}
+    created: list[str] = []
+    for harness in harnesses:
+        base = root / OPENSPEC_SKILL_ROOT[harness]
+        key = f"{OPENSPEC_SKILL_ROOT[harness].as_posix()}:openspec-*/SKILL.md"
+        if dry_run:
+            verification[key] = True
+            continue
+        if not lstat_exists(base):
+            verification[key] = False
+            raise BootstrapError(f"OpenSpec {harness} Skill 根目录不存在。")
+        ensure_safe_path(root, base, for_write=False)
+        if not base.is_dir() or base.is_symlink():
+            raise BootstrapError(f"OpenSpec {harness} Skill 根目录不安全。")
+        reject_symlinks_in_tree(root, base)
+        skill_files: list[Path] = []
+        for child in sorted(base.iterdir()):
+            if not child.name.startswith("openspec-") or not child.is_dir():
+                continue
+            skill_file = child / "SKILL.md"
+            if not lstat_exists(skill_file):
+                continue
+            ensure_safe_path(root, skill_file, for_write=False)
+            if skill_file.is_file() and not skill_file.is_symlink():
+                if not verify_generated_skill_document(
+                    root, skill_file, child.name
+                ):
+                    raise BootstrapError(
+                        f"OpenSpec {harness} Skill 文档无效或为占位内容："
+                        f"{skill_file.relative_to(root)}"
+                    )
+                skill_files.append(skill_file)
+        verification[key] = bool(skill_files)
+        if not skill_files:
+            raise BootstrapError(
+                f"OpenSpec {harness} 未生成有效的 openspec-*/SKILL.md。"
+            )
+        for skill_file in skill_files:
+            relative = skill_file.parent.relative_to(root).as_posix()
+            checksums[relative] = hash_skill_directory(root, skill_file)
+            created.append(relative + "/")
+    return verification, checksums, created
 
 
 def protect_paths(root: Path, paths: Iterable[Path]) -> None:
     for path in paths:
         ensure_safe_path(root, path, for_write=True)
+        reject_symlinks_in_tree(root, path)
 
 
 def install_openspec(
@@ -1306,15 +2124,16 @@ def install_openspec(
         if not ok:
             raise BootstrapError(f"OpenSpec 初始化后缺少目录：{relative}")
         outcome.created_or_managed.append(str(relative) + "/")
-    for harness in harnesses:
-        base = root / OPENSPEC_SKILL_ROOT[harness]
-        ok = dry_run or safe_recursive_contains(root, base, "openspec-")
-        key = f"{OPENSPEC_SKILL_ROOT[harness].as_posix()}:openspec-*"
-        outcome.verification[key] = ok
-        if not ok:
-            raise BootstrapError(f"OpenSpec 未为 {harness} 生成预期 Skills：{base.relative_to(root)}")
-        outcome.created_or_managed.append(str(base.relative_to(root)) + "/")
-    outcome.activation_notes.append("开始新 Agent 会话后使用 OpenSpec 的 propose/apply/archive Skills。")
+    verification, checksums, created = verify_openspec_skills(
+        root, harnesses, dry_run=dry_run
+    )
+    outcome.verification.update(verification)
+    outcome.checksums.update(checksums)
+    outcome.created_or_managed.extend(created)
+    if not dry_run:
+        outcome.activation_notes.append(
+            "开始新 Agent 会话后使用 OpenSpec 的 propose/apply/archive Skills。"
+        )
     return outcome
 
 
@@ -1349,8 +2168,8 @@ def parse_codex_plugin_list(raw: str) -> dict[str, list[dict[str, Any]]]:
             marketplace = marketplace_match.group(1)
             continue
         plugin_match = re.fullmatch(
-            r"\s{2}(.+?)@([^\s]+) \((installed|not installed), "
-            r"(enabled|disabled)\)",
+            r"\s{2}(.+?)@([^\s]+) \((installed|not installed)"
+            r"(?:, (enabled|disabled))?\)",
             line,
         )
         if not plugin_match:
@@ -1377,23 +2196,58 @@ def plugin_marketplace(entry: Mapping[str, Any]) -> str:
     return str(entry.get("marketplaceName") or entry.get("marketplace") or "")
 
 
-def find_codex_plugin(data: Any, framework: str, *, installed_only: bool = False) -> dict[str, Any] | None:
+def plugin_is_installed(entry: Mapping[str, Any]) -> bool:
+    section = str(entry.get("_selector_section") or "")
+    installed = entry.get("installed")
+    if installed is False or section == "available" and installed is not True:
+        return False
+    return installed is True or section == "installed"
+
+
+def plugin_spec(entry: Mapping[str, Any]) -> str:
+    name = plugin_name(entry).split("@", 1)[0]
+    marketplace = plugin_marketplace(entry)
+    if not marketplace:
+        plugin_id = str(entry.get("pluginId") or "")
+        if "@" in plugin_id:
+            marketplace = plugin_id.split("@", 1)[1]
+    safe_part = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+    if not safe_part.fullmatch(name) or not safe_part.fullmatch(marketplace):
+        return ""
+    return f"{name}@{marketplace}"
+
+
+def find_codex_plugin(
+    data: Any,
+    framework: str,
+    *,
+    installed_only: bool = False,
+    marketplace: str | None = None,
+) -> dict[str, Any] | None:
     names = PLUGIN_FRAMEWORK_NAMES[framework]
+    matches: list[dict[str, Any]] = []
     for entry in codex_plugin_entries(data):
         name = plugin_name(entry).lower().split("@")[0]
         if name not in names:
             continue
-        if installed_only:
-            section = str(entry.get("_selector_section") or "")
-            installed = entry.get("installed")
-            if section == "available" and installed is not True:
-                continue
-            if section == "plugins" and installed is not True:
-                continue
-            if installed is False:
-                continue
-        return entry
-    return None
+        if marketplace and plugin_marketplace(entry) != marketplace:
+            continue
+        if installed_only and not plugin_is_installed(entry):
+            continue
+        matches.append(entry)
+    if not matches:
+        return None
+
+    def priority(entry: Mapping[str, Any]) -> tuple[bool, bool, bool]:
+        installed = plugin_is_installed(entry)
+        enabled = bool(entry.get("enabled", True))
+        return (
+            not (installed and enabled),
+            plugin_marketplace(entry) != "openai-curated",
+            not installed,
+        )
+
+    return min(matches, key=priority)
 
 
 def codex_plugin_inventory(root: Path, *, dry_run: bool, timeout: int, include_available: bool) -> Any:
@@ -1419,27 +2273,26 @@ def codex_plugin_inventory(root: Path, *, dry_run: bool, timeout: int, include_a
     installed = [
         entry
         for entry in codex_plugin_entries(data)
-        if entry.get("installed") is True
+        if plugin_is_installed(entry)
     ]
     return {"plugins": installed}
 
 
 
 def detect_codex_plugin_frameworks(
-    root: Path, *, dry_run: bool, timeout: int
+    root: Path,
+    *,
+    dry_run: bool,
+    timeout: int,
+    inventory_out: dict[str, Any] | None = None,
 ) -> set[str]:
-    if dry_run or not shutil.which("codex"):
-        return set()
-    try:
-        data = codex_plugin_inventory(
-            root, dry_run=False, timeout=timeout, include_available=False
-        )
-    except BootstrapError as exc:
-        print(
-            f"警告：无法读取 Codex 插件清单，宿主级冲突检测不完整：{exc}",
-            file=sys.stderr,
-        )
-        return set()
+    if not shutil.which("codex"):
+        raise BootstrapError("无法读取 Codex 插件冲突：缺少 codex 命令。")
+    data = codex_plugin_inventory(
+        root, dry_run=False, timeout=timeout, include_available=True
+    )
+    if inventory_out is not None:
+        inventory_out["codex"] = data
     entry = find_codex_plugin(data, "superpowers", installed_only=True)
     if entry and bool(entry.get("enabled", True)):
         return {"superpowers"}
@@ -1454,38 +2307,52 @@ def install_codex_plugin(
     dry_run: bool,
     timeout: int,
     mutation_tracker: MutationTracker,
+    plugin_inventory: Any | None = None,
 ) -> InstallOutcome:
     if framework != "superpowers":
         raise BootstrapError(f"不支持的 Codex 官方插件：{framework}")
     require_executable("codex")
     outcome = InstallOutcome(framework=framework, integration="official")
 
-    inventory = codex_plugin_inventory(
-        root, dry_run=dry_run, timeout=timeout, include_available=True
+    inventory = (
+        plugin_inventory
+        if plugin_inventory is not None
+        else codex_plugin_inventory(
+            root,
+            dry_run=False,
+            timeout=timeout,
+            include_available=True,
+        )
     )
-    entry = find_codex_plugin(inventory, framework)
-    if dry_run:
-        plugin_spec = "superpowers@<official-marketplace>"
-    else:
-        if not entry:
-            raise BootstrapError("Codex Marketplace 中未找到 Superpowers 插件。")
-        name = plugin_name(entry).split("@")[0]
-        marketplace = plugin_marketplace(entry)
-        if not marketplace:
-            plugin_id = str(entry.get("pluginId") or "")
-            if "@" in plugin_id:
-                marketplace = plugin_id.split("@", 1)[1]
-        if not marketplace:
-            raise BootstrapError("无法确定 Superpowers 插件所属 Marketplace。")
-        plugin_spec = f"{name}@{marketplace}"
+    entry = find_codex_plugin(
+        inventory,
+        framework,
+        marketplace=CODEX_OFFICIAL_MARKETPLACE,
+    )
+    if not entry:
+        raise BootstrapError(
+            "Codex 官方 Marketplace 中未找到 Superpowers 插件。"
+        )
+    resolved_spec = plugin_spec(entry)
+    if not resolved_spec:
+        raise BootstrapError("无法确定 Superpowers 插件所属 Marketplace。")
+    plugin_spec_value = resolved_spec
 
     installed_entry = find_codex_plugin(
-        inventory, framework, installed_only=True
+        inventory,
+        framework,
+        installed_only=True,
+        marketplace=CODEX_OFFICIAL_MARKETPLACE,
     )
+    if installed_entry and not bool(installed_entry.get("enabled", True)):
+        raise BootstrapError(
+            f"Codex Superpowers 插件 {plugin_spec_value} 已安装但未启用；"
+            "请先在 Codex 中重新启用，或显式移除后再重试。"
+        )
     if not installed_entry:
         mutation_tracker.mark(dry_run=dry_run)
         run(
-            ("codex", "plugin", "add", plugin_spec),
+            ("codex", "plugin", "add", plugin_spec_value),
             cwd=root,
             dry_run=dry_run,
             timeout=timeout,
@@ -1499,7 +2366,10 @@ def install_codex_plugin(
             root, dry_run=False, timeout=timeout, include_available=False
         )
         final_entry = find_codex_plugin(
-            final_inventory, framework, installed_only=True
+            final_inventory,
+            framework,
+            installed_only=True,
+            marketplace=CODEX_OFFICIAL_MARKETPLACE,
         )
         ok = final_entry is not None and bool(final_entry.get("enabled", True))
         outcome.verification["codex-plugin:superpowers"] = ok
@@ -1509,9 +2379,22 @@ def install_codex_plugin(
             )
         if final_entry and final_entry.get("version"):
             outcome.versions[framework] = str(final_entry["version"])
+        if final_entry:
+            final_spec = plugin_spec(final_entry)
+            if not final_spec:
+                raise BootstrapError("无法记录 Codex Superpowers 插件身份。")
+            outcome.identities["codex-plugin:superpowers"] = final_spec
+
+    if dry_run:
+        outcome.identities["codex-plugin:superpowers"] = plugin_spec_value
+    outcome.host_readiness["codex"] = {
+        "installation": "ready",
+        "activation": "ready",
+    }
 
     outcome.created_or_managed.append("Codex plugin: superpowers")
-    outcome.activation_notes.append("开始一个新 Codex 会话以加载插件。")
+    if not dry_run:
+        outcome.activation_notes.append("开始一个新 Codex 会话以加载插件。")
     return outcome
 
 
@@ -1544,12 +2427,67 @@ def pending_official_install(
         ),
     }
     for harness in harnesses:
+        outcome.host_readiness[harness] = {
+            "installation": "pending",
+            "activation": "unknown",
+        }
         outcome.pending_actions.append(
             actions.get(
                 harness,
                 f"当前选择器无法无交互完成 Superpowers 在 {harness} 的官方安装。",
             )
         )
+    outcome.limitations.append(
+        "非 Codex 官方插件由用户在宿主中安装；Agent Compass 只能记录显式人工确认。"
+    )
+    return outcome
+
+
+def merge_outcome(target: InstallOutcome, source: InstallOutcome) -> None:
+    target.created_or_managed.extend(source.created_or_managed)
+    target.versions.update(source.versions)
+    target.identities.update(source.identities)
+    target.source_revisions.update(source.source_revisions)
+    target.checksums.update(source.checksums)
+    target.verification.update(source.verification)
+    target.host_readiness.update(source.host_readiness)
+    target.pending_actions.extend(source.pending_actions)
+    target.activation_notes.extend(source.activation_notes)
+    target.limitations.extend(source.limitations)
+    target.external_commands_ran = (
+        target.external_commands_ran or source.external_commands_ran
+    )
+
+
+def install_superpowers_official(
+    root: Path,
+    harnesses: Sequence[str],
+    *,
+    dry_run: bool,
+    timeout: int,
+    mutation_tracker: MutationTracker,
+    plugin_inventory: Any | None = None,
+) -> InstallOutcome:
+    outcome = InstallOutcome("superpowers", "official")
+    if "codex" in harnesses:
+        merge_outcome(
+            outcome,
+            install_codex_plugin(
+                root,
+                "superpowers",
+                dry_run=dry_run,
+                timeout=timeout,
+                mutation_tracker=mutation_tracker,
+                plugin_inventory=plugin_inventory,
+            ),
+        )
+    manual_hosts = [harness for harness in harnesses if harness != "codex"]
+    if manual_hosts:
+        merge_outcome(
+            outcome,
+            pending_official_install("superpowers", manual_hosts),
+        )
+        outcome.status = "pending"
     return outcome
 
 
@@ -1577,6 +2515,7 @@ def install_framework(
     args: argparse.Namespace,
     transaction: ManagedFileTransaction,
     mutation_tracker: MutationTracker,
+    plugin_inventory: Any | None = None,
 ) -> InstallOutcome:
     if framework == "trellis":
         return install_trellis(
@@ -1588,6 +2527,7 @@ def install_framework(
             dry_run=args.dry_run,
             timeout=args.timeout,
             mutation_tracker=mutation_tracker,
+            language=args.language,
         )
     if framework == "openspec":
         return install_openspec(
@@ -1623,15 +2563,14 @@ def install_framework(
         )
     if integration != "official":
         raise BootstrapError(f"不支持的集成方式：{integration}")
-    if harnesses == ["codex"]:
-        return install_codex_plugin(
-            root,
-            "superpowers",
-            dry_run=args.dry_run,
-            timeout=args.timeout,
-            mutation_tracker=mutation_tracker,
-        )
-    return pending_official_install("superpowers", harnesses)
+    return install_superpowers_official(
+        root,
+        harnesses,
+        dry_run=args.dry_run,
+        timeout=args.timeout,
+        mutation_tracker=mutation_tracker,
+        plugin_inventory=plugin_inventory,
+    )
 
 
 
@@ -1645,6 +2584,8 @@ def finalize_framework(
     timeout: int,
     confirm_trellis_activation: bool = False,
     confirm_trellis_bootstrap: bool = False,
+    confirm_superpowers_installation: bool = False,
+    plugin_inventory: Any | None = None,
 ) -> InstallOutcome:
     outcome = InstallOutcome(framework=framework, integration=integration)
     if framework == "matt":
@@ -1655,13 +2596,19 @@ def finalize_framework(
         outcome.checksums.update(checksums)
         outcome.created_or_managed.extend(created)
         setup = (
-            verify_matt_setup(root)
+            verify_matt_setup(root, harnesses)
             if not dry_run
-            else {
-                "docs/agents/issue-tracker.md": True,
-                "docs/agents/domain.md": True,
-                "instruction:Agent skills": True,
-            }
+            else dict.fromkeys(
+                [
+                    "docs/agents/issue-tracker.md",
+                    "docs/agents/domain.md",
+                    *(
+                        f"instruction:{path.relative_to(root)}:Agent skills"
+                        for path in instruction_files(root, harnesses)
+                    ),
+                ],
+                True,
+            )
         )
         outcome.verification.update(setup)
         missing = [name for name, ok in setup.items() if not ok]
@@ -1669,6 +2616,17 @@ def finalize_framework(
             raise BootstrapError(
                 "Matt 初始化尚未完成，缺少：" + ", ".join(missing)
             )
+        if not dry_run:
+            outcome.checksums.update(
+                matt_setup_checksums(root, harnesses)
+            )
+            outcome.source_revisions[
+                SOURCE_REPOSITORIES["matt"]
+            ] = verify_project_skills_lock_provenance(root, "matt")
+        else:
+            outcome.source_revisions[
+                SOURCE_REPOSITORIES["matt"]
+            ] = "<verified-lock-revision>"
         outcome.versions["skills-cli"] = SKILLS_CLI_VERSION
         return outcome
 
@@ -1676,6 +2634,14 @@ def finalize_framework(
         if not trellis_core_valid(root):
             raise BootstrapError("Trellis 核心文件不完整。")
         outcome.verification["trellis-core"] = True
+        for relative in (
+            Path(".trellis/.version"),
+            Path(".trellis/workflow.md"),
+            Path(".trellis/config.yaml"),
+        ):
+            outcome.checksums[str(relative)] = hash_file(
+                root, root / relative
+            )
         for harness in harnesses:
             for relative in TRELLIS_PLATFORM_PATHS[harness]:
                 path = root / relative
@@ -1688,18 +2654,24 @@ def finalize_framework(
                     raise BootstrapError(
                         f"Trellis 平台配置缺失或类型错误：{relative}"
                     )
-        activation = (
-            "ready"
-            if "codex" not in harnesses or confirm_trellis_activation
-            else "pending"
-        )
+                outcome.checksums[str(relative)] = hash_verified_path(
+                    root, path, expect_directory=expect_directory
+                )
+        host_activation = {
+            harness: (
+                "ready"
+                if harness != "codex" or confirm_trellis_activation
+                else "pending"
+            )
+            for harness in harnesses
+        }
         bootstrap = "ready" if confirm_trellis_bootstrap else "pending"
         set_trellis_readiness(
             outcome,
-            activation=activation,
+            host_activation=host_activation,
             bootstrap=bootstrap,
         )
-        if activation == "pending":
+        if host_activation.get("codex") == "pending":
             outcome.pending_actions.append(
                 "启用 Codex hooks 并通过 `/hooks` 审批后，"
                 "使用 --finalize --confirm-trellis-activation。"
@@ -1723,15 +2695,12 @@ def finalize_framework(
             outcome.verification[str(relative) + "/"] = ok
             if not ok:
                 raise BootstrapError(f"OpenSpec 核心目录缺失：{relative}")
-        for harness in harnesses:
-            ok = dry_run or safe_recursive_contains(
-                root, root / OPENSPEC_SKILL_ROOT[harness], "openspec-"
-            )
-            outcome.verification[
-                f"{OPENSPEC_SKILL_ROOT[harness]}:openspec-*"
-            ] = ok
-            if not ok:
-                raise BootstrapError(f"OpenSpec {harness} 集成缺失。")
+        verification, checksums, created = verify_openspec_skills(
+            root, harnesses, dry_run=dry_run
+        )
+        outcome.verification.update(verification)
+        outcome.checksums.update(checksums)
+        outcome.created_or_managed.extend(created)
         return outcome
 
     if framework != "superpowers":
@@ -1744,21 +2713,45 @@ def finalize_framework(
         outcome.verification.update(verification)
         outcome.checksums.update(checksums)
         outcome.created_or_managed.extend(created)
+        instruction_ok = dry_run or verify_framework_instruction(
+            root, harnesses, "superpowers", "project-skills"
+        )
+        outcome.verification["framework-instruction"] = instruction_ok
+        if not instruction_ok:
+            raise BootstrapError(
+                "Superpowers project-skills 托管指令缺失或已变化。"
+            )
+        if not dry_run:
+            outcome.source_revisions[
+                SOURCE_REPOSITORIES["superpowers"]
+            ] = verify_project_skills_lock_provenance(
+                root, "superpowers"
+            )
+        else:
+            outcome.source_revisions[
+                SOURCE_REPOSITORIES["superpowers"]
+            ] = "<verified-lock-revision>"
+        outcome.versions["skills-cli"] = SKILLS_CLI_VERSION
         return outcome
 
-    if harnesses == ["codex"]:
-        data = codex_plugin_inventory(
-            root,
-            dry_run=dry_run,
-            timeout=timeout,
-            include_available=False,
+    if "codex" in harnesses:
+        data = (
+            plugin_inventory
+            if plugin_inventory is not None
+            else codex_plugin_inventory(
+                root,
+                dry_run=False,
+                timeout=timeout,
+                include_available=False,
+            )
         )
         entry = find_codex_plugin(
-            data, "superpowers", installed_only=True
+            data,
+            "superpowers",
+            installed_only=True,
+            marketplace=CODEX_OFFICIAL_MARKETPLACE,
         )
-        ok = dry_run or (
-            entry is not None and bool(entry.get("enabled", True))
-        )
+        ok = entry is not None and bool(entry.get("enabled", True))
         outcome.verification["codex-plugin:superpowers"] = ok
         if not ok:
             raise BootstrapError(
@@ -1766,12 +2759,54 @@ def finalize_framework(
             )
         if entry and entry.get("version"):
             outcome.versions["superpowers"] = str(entry["version"])
-        return outcome
+        if entry:
+            resolved_spec = plugin_spec(entry)
+            if not resolved_spec:
+                raise BootstrapError("无法记录 Codex Superpowers 插件身份。")
+            outcome.identities["codex-plugin:superpowers"] = resolved_spec
+        outcome.host_readiness["codex"] = {
+            "installation": "ready",
+            "activation": "ready",
+        }
 
-    raise BootstrapError(
-        "该官方集成无法由脚本自动验证；请完成宿主安装后手工确认，"
-        "或改用 project-skills 模式。"
-    )
+    manual_hosts = [harness for harness in harnesses if harness != "codex"]
+    if manual_hosts and not confirm_superpowers_installation:
+        pending = pending_official_install("superpowers", manual_hosts)
+        merge_outcome(outcome, pending)
+        outcome.status = "pending"
+        return outcome
+    for harness in manual_hosts:
+        outcome.verification[f"host-confirmed:{harness}:superpowers"] = True
+        outcome.host_readiness[harness] = {
+            "installation": "ready",
+            "activation": "ready",
+        }
+    if manual_hosts:
+        outcome.limitations.append(
+            "非 Codex 官方插件状态来自用户显式确认，无法由 Agent Compass 机器验证。"
+        )
+    return outcome
+
+
+def merge_readiness_value(previous: str, current: str) -> str:
+    for value in (previous, current):
+        if value not in READINESS_VALUES:
+            raise BootstrapError(f"非法 readiness 值：{value}")
+    order = {"unknown": 0, "pending": 1, "ready": 2}
+    return previous if order[previous] >= order[current] else current
+
+
+def aggregate_host_readiness(
+    host_readiness: Mapping[str, Mapping[str, str]], field_name: str
+) -> str:
+    values = [str(values.get(field_name, "unknown")) for values in host_readiness.values()]
+    if any(value not in READINESS_VALUES for value in values):
+        raise BootstrapError(f"非法 host readiness 字段：{field_name}")
+    if not values or "unknown" in values:
+        return "unknown"
+    if "pending" in values:
+        return "pending"
+    return "ready"
 
 
 def state_payload(
@@ -1803,13 +2838,73 @@ def state_payload(
             dict.fromkeys([*(str(item) for item in prior), *current])
         )
 
-    def merged_readiness() -> dict[str, str]:
-        base = previous.get("readiness", {}) if same_selection and previous else {}
-        merged = dict(base) if isinstance(base, Mapping) else {}
+    def merged_host_readiness() -> dict[str, dict[str, str]]:
+        base_value = (
+            previous.get("host_readiness", {})
+            if same_selection
+            and previous
+            and previous.get("schema") == STATE_SCHEMA
+            else {}
+        )
+        merged: dict[str, dict[str, str]] = {}
+        if isinstance(base_value, Mapping):
+            for host, values in base_value.items():
+                if host in ACTIVE_HARNESSES and isinstance(values, Mapping):
+                    merged[str(host)] = {
+                        str(key): str(value) for key, value in values.items()
+                    }
+        for host, values in outcome.host_readiness.items():
+            if host not in ACTIVE_HARNESSES:
+                raise BootstrapError(f"非法 outcome host readiness：{host}")
+            target = merged.setdefault(host, {})
+            for key, value in values.items():
+                current = str(value)
+                previous_value = str(target.get(key, "unknown"))
+                target[str(key)] = merge_readiness_value(
+                    previous_value, current
+                )
+        return merged
+
+    def merged_readiness(
+        host_values: Mapping[str, Mapping[str, str]]
+    ) -> dict[str, str]:
+        preserve_base = bool(
+            same_selection
+            and previous
+            and (
+                outcome.framework not in {"trellis", "superpowers"}
+                or previous.get("schema") == STATE_SCHEMA
+            )
+        )
+        base = previous.get("readiness", {}) if preserve_base and previous else {}
+        merged = {
+            str(key): str(value)
+            for key, value in base.items()
+        } if isinstance(base, Mapping) else {}
         for key, value in outcome.readiness.items():
-            if value != "unknown" or key not in merged:
-                merged[key] = value
-        return {str(key): str(value) for key, value in merged.items()}
+            current = str(value)
+            merged[str(key)] = merge_readiness_value(
+                str(merged.get(key, "unknown")), current
+            )
+        if outcome.framework == "trellis":
+            merged["installation"] = aggregate_host_readiness(
+                host_values, "installation"
+            )
+            merged["activation"] = aggregate_host_readiness(
+                host_values, "activation"
+            )
+            merged.setdefault("bootstrap", "unknown")
+        elif outcome.framework == "superpowers" and outcome.integration == "official":
+            merged["installation"] = aggregate_host_readiness(
+                host_values, "installation"
+            )
+            merged["activation"] = aggregate_host_readiness(
+                host_values, "activation"
+            )
+        for key, value in merged.items():
+            if value not in READINESS_VALUES:
+                raise BootstrapError(f"非法 state readiness：{key}={value}")
+        return merged
 
     prior_harnesses = (
         previous.get("harnesses", []) if same_selection and previous else []
@@ -1834,15 +2929,24 @@ def state_payload(
         if same_selection and previous
         else False
     )
-    readiness = merged_readiness()
+    host_readiness = merged_host_readiness()
+    readiness = merged_readiness(host_readiness)
     effective_status = outcome.status
     if outcome.framework == "trellis":
         effective_status = trellis_status_from_readiness(readiness)
+    elif outcome.framework == "superpowers" and outcome.integration == "official":
+        effective_status = (
+            "ready"
+            if readiness.get("installation") == "ready"
+            and readiness.get("activation") == "ready"
+            else "pending"
+        )
     return {
         "schema": STATE_SCHEMA,
         "installer": f"agent-compass/{VERSION}",
         "status": effective_status,
         "readiness": readiness,
+        "host_readiness": host_readiness,
         "framework": outcome.framework,
         "integration": outcome.integration,
         "harnesses": effective_harnesses,
@@ -1856,10 +2960,9 @@ def state_payload(
         "installed_at": first_installed or now,
         "updated_at": now,
         "versions": merged_mapping("versions", outcome.versions),
-        "source_revisions": merged_mapping(
-            "source_revisions", outcome.source_revisions
-        ),
-        "checksums": merged_mapping("checksums", outcome.checksums),
+        "identities": dict(outcome.identities),
+        "source_revisions": dict(outcome.source_revisions),
+        "checksums": dict(outcome.checksums),
         "created_or_managed": sorted(
             set(
                 merged_list(
@@ -1867,9 +2970,7 @@ def state_payload(
                 )
             )
         ),
-        "verification": merged_mapping(
-            "verification", outcome.verification
-        ),
+        "verification": dict(outcome.verification),
         "pending_actions": outcome.pending_actions,
         "activation_notes": merged_list(
             "activation_notes", outcome.activation_notes
@@ -1888,15 +2989,21 @@ def write_state(
     minimal: bool,
     dry_run: bool,
     transaction: ManagedFileTransaction,
-) -> None:
+) -> dict[str, Any]:
     path = root / STATE_FILE
     previous = load_state(root)
     state = state_payload(
         outcome, harnesses, previous, minimal=minimal
     )
     state_status = str(state["status"])
-    print(f"write {STATE_FILE} ({state_status})")
-    if not dry_run:
+    validate_recorded_state(state, require_current_schema=True)
+    if dry_run:
+        print(
+            f"would write {STATE_FILE} "
+            "(simulation only; readiness was not verified)"
+        )
+    else:
+        print(f"write {STATE_FILE} ({state_status})")
         transaction.snapshot(path)
         mode = (
             stat.S_IMODE(path.lstat().st_mode)
@@ -1910,8 +3017,9 @@ def write_state(
             mode=mode,
         )
         reread = load_state(root)
-        if not reread or reread.get("status") != state_status:
+        if reread != state:
             raise BootstrapError("状态文件写入后验证失败。")
+    return state
 
 
 def validate_integration_consistency(
@@ -1930,8 +3038,6 @@ def validate_integration_consistency(
                 f"项目已记录 {framework}/{recorded}，拒绝叠加 {integration}。"
                 "请先人工卸载旧集成并移走状态文件。"
             )
-    if finalize:
-        return
     managed = detect_managed_instruction_frameworks(root) | detect_frameworks_from_lock(root)
     if integration == "official" and framework in managed:
         raise BootstrapError(
@@ -1941,6 +3047,133 @@ def validate_integration_consistency(
         raise BootstrapError(
             f"检测到已安装的 Codex {framework} 官方插件，拒绝再安装项目 Skills 版。"
         )
+
+
+def validate_option_scope(
+    args: argparse.Namespace, framework: str, integration: str | None
+) -> None:
+    if framework == "none":
+        if any(
+            (
+                args.harness,
+                args.integration != "auto",
+                args.user,
+                args.trellis_version,
+                args.openspec_version,
+                args.repair,
+                args.finalize,
+                args.minimal,
+                args.confirm_trellis_activation,
+                args.confirm_trellis_bootstrap,
+                args.confirm_superpowers_installation,
+            )
+        ):
+            raise BootstrapError("`none` 不能与安装、finalize 或配置参数组合。")
+        return
+    trellis_confirmed = (
+        args.confirm_trellis_activation or args.confirm_trellis_bootstrap
+    )
+    if trellis_confirmed and (not args.finalize or framework != "trellis"):
+        raise BootstrapError("Trellis 确认参数只能用于 trellis --finalize。")
+    if args.confirm_superpowers_installation and (
+        not args.finalize
+        or framework != "superpowers"
+        or integration != "official"
+    ):
+        raise BootstrapError(
+            "Superpowers 人工确认只适用于 official superpowers --finalize。"
+        )
+    if args.repair and (framework != "trellis" or args.finalize):
+        raise BootstrapError("--repair 只适用于 Trellis 初始安装/修复。")
+    if (args.user or args.trellis_version) and (
+        framework != "trellis" or args.finalize
+    ):
+        raise BootstrapError("--user/--trellis-version 只适用于 Trellis 安装。")
+    if args.openspec_version and (framework != "openspec" or args.finalize):
+        raise BootstrapError("--openspec-version 只适用于 OpenSpec 安装。")
+
+
+def merge_recorded_harnesses(
+    previous: Mapping[str, Any] | None,
+    framework: str,
+    integration: str,
+    harnesses: Sequence[str],
+) -> list[str]:
+    if not previous:
+        return list(harnesses)
+    previous_framework = canonical_framework(
+        str(previous.get("framework") or "")
+    )
+    if (
+        previous_framework != framework
+        or str(previous.get("integration") or "") != integration
+    ):
+        return list(harnesses)
+    _, _, recorded = validate_recorded_state(
+        previous, require_current_schema=False
+    )
+    return list(dict.fromkeys([*recorded, *harnesses]))
+
+
+def validate_confirmation_hosts(
+    args: argparse.Namespace, harnesses: Sequence[str]
+) -> None:
+    if args.confirm_trellis_activation and "codex" not in harnesses:
+        raise BootstrapError(
+            "--confirm-trellis-activation 只在已记录 Codex 宿主时有效。"
+        )
+    if args.confirm_superpowers_installation and all(
+        harness == "codex" for harness in harnesses
+    ):
+        raise BootstrapError(
+            "--confirm-superpowers-installation 只用于非 Codex 官方宿主。"
+        )
+
+
+def ensure_no_framework_conflicts(
+    root: Path,
+    framework: str,
+    integration: str,
+    harnesses: Sequence[str],
+    *,
+    repair: bool,
+    dry_run: bool,
+    timeout: int,
+    finalize: bool,
+) -> Any | None:
+    existing = detect_existing_frameworks(root, repair=repair)
+    codex_plugins: set[str] = set()
+    inventory_holder: dict[str, Any] = {}
+    if "codex" in harnesses:
+        codex_plugins = detect_codex_plugin_frameworks(
+            root,
+            dry_run=dry_run,
+            timeout=timeout,
+            inventory_out=inventory_holder,
+        )
+        existing.update(codex_plugins)
+    conflicts = existing - {framework}
+    if conflicts:
+        legacy = conflicts & LEGACY_FRAMEWORKS
+        suffix = (
+            " 其中包含已移除的遗留框架，请先按官方方式卸载或迁移。"
+            if legacy
+            else ""
+        )
+        raise BootstrapError(
+            "检测到其他框架："
+            + ", ".join(sorted(conflicts))
+            + "。本工具不会自动删除或混用；请先人工处理后重试。"
+            + suffix
+        )
+    validate_integration_consistency(
+        root,
+        framework,
+        integration,
+        detected_codex_plugins=codex_plugins,
+        finalize=finalize,
+    )
+    return inventory_holder.get("codex")
 
 
 
@@ -1968,6 +3201,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--integration",
         default="auto",
         choices=INTEGRATIONS,
+    )
+    parser.add_argument(
+        "--language",
+        default="auto",
+        choices=("auto", "zh", "en"),
+        help="Questionnaire, summary, and doctor language; default follows the locale",
     )
     parser.add_argument(
         "--project-root",
@@ -2012,6 +3251,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --finalize, confirm the initial Trellis spec bootstrap is complete",
     )
     parser.add_argument(
+        "--confirm-superpowers-installation",
+        action="store_true",
+        help="With --finalize, confirm non-Codex official Superpowers installation",
+    )
+    parser.add_argument(
         "--yes",
         action="store_true",
         help="Skip final confirmation",
@@ -2036,64 +3280,207 @@ def describe_plan(
     harnesses: Sequence[str],
     *,
     minimal: bool,
+    language: str = "auto",
 ) -> str:
+    language = detect_prompt_language(language)
+    if language == "zh":
+        scope = {
+            ("trellis", "official"): "初始化长期项目规范、任务和工作记忆",
+            ("openspec", "official"): "安装轻量 proposal/apply/archive 规格流程",
+            ("matt", "project-skills"): "安装按需调用的调试、评审、设计和 TDD Skills",
+            ("superpowers", "official"): "安装并验证宿主官方 Superpowers 插件",
+            ("superpowers", "project-skills"): (
+                "安装可编辑的项目 Skills 兼容模式；不包含宿主 Hook"
+            ),
+        }.get((framework, integration), "执行所选集成")
+        suffix = "；启用最小正确修改规则" if minimal else ""
+        return (
+            f"选择：{framework} / {integration} / "
+            f"{', '.join(harnesses)}；{scope}{suffix}。"
+        )
+
     scope = {
-        ("trellis", "official"): "初始化长期项目规范、任务和工作记忆",
-        ("openspec", "official"): "安装轻量 proposal/apply/archive 规格流程",
-        ("matt", "project-skills"): "安装按需调用的调试、评审、设计和 TDD Skills",
-        ("superpowers", "official"): "安装并验证宿主官方 Superpowers 插件",
-        ("superpowers", "project-skills"): (
-            "安装可编辑的项目 Skills 兼容模式；不包含宿主 Hook"
+        ("trellis", "official"): (
+            "initialize long-lived project specifications, tasks, and memory"
         ),
-    }.get((framework, integration), "执行所选集成")
-    suffix = "；启用最小正确修改规则" if minimal else ""
+        ("openspec", "official"): (
+            "install the lightweight proposal/apply/archive specification flow"
+        ),
+        ("matt", "project-skills"): (
+            "install on-demand debugging, review, design, and TDD Skills"
+        ),
+        ("superpowers", "official"): (
+            "install and verify the host's official Superpowers plugin"
+        ),
+        ("superpowers", "project-skills"): (
+            "install the editable project-Skills compatibility mode without "
+            "host hooks"
+        ),
+    }.get((framework, integration), "run the selected integration")
+    suffix = "; enable the smallest-correct-change rule" if minimal else ""
     return (
-        f"选择：{framework} / {integration} / "
-        f"{', '.join(harnesses)}；{scope}{suffix}。"
+        f"Selection: {framework} / {integration} / "
+        f"{', '.join(harnesses)}; {scope}{suffix}."
     )
 
 
-def doctor_project(root: Path, *, timeout: int) -> int:
+def doctor_project(
+    root: Path, *, timeout: int, language: str = "auto"
+) -> int:
     """Verify recorded setup without modifying project or host state."""
-    state = load_state(root)
-    print(f"项目：{root}")
-    if not state:
+    language = detect_prompt_language(language)
+    print(localized_text(language, f"项目：{root}", f"Project: {root}"))
+    lock_path = root / LOCK_FILE
+    if lstat_exists(lock_path):
         try:
-            detected = sorted(detect_existing_frameworks(root))
+            ensure_safe_path(root, lock_path, for_write=False)
         except BootstrapError as exc:
-            print(f"诊断失败：{exc}")
+            print(
+                localized_text(
+                    language,
+                    f"诊断失败：{exc}",
+                    f"Doctor failed: {exc}",
+                )
+            )
             return 1
-        if detected:
-            print("诊断：检测到未由 Agent Compass 记录的框架：" + ", ".join(detected))
-        else:
-            print("诊断：未找到 Agent Compass 状态或已知框架。")
+        print(
+            localized_text(
+                language,
+                f"诊断待处理：检测到 {LOCK_FILE}，变更流程可能正在运行。",
+                f"Doctor needs attention: {LOCK_FILE} exists; a mutation "
+                "may be in progress.",
+            )
+        )
         return 1
 
-    framework = canonical_framework(str(state.get("framework") or ""))
-    integration = str(state.get("integration") or "")
-    raw_harnesses = state.get("harnesses", [])
-    if framework not in FRAMEWORKS or framework in {"auto", "none"}:
-        print("诊断失败：状态文件中的 framework 无效。")
+    try:
+        state = load_state(root)
+    except BootstrapError as exc:
+        print(
+            localized_text(
+                language,
+                f"诊断失败：{exc}",
+                f"Doctor failed: {exc}",
+            )
+        )
         return 1
-    if not isinstance(raw_harnesses, list) or not raw_harnesses:
-        print("诊断失败：状态文件没有有效的 harnesses。")
+    if not state:
+        try:
+            detected_set = detect_existing_frameworks(root)
+            if shutil.which("codex"):
+                detected_set.update(
+                    detect_codex_plugin_frameworks(
+                        root, dry_run=False, timeout=timeout
+                    )
+                )
+            detected = sorted(detected_set)
+        except BootstrapError as exc:
+            print(
+                localized_text(
+                    language,
+                    f"诊断失败：{exc}",
+                    f"Doctor failed: {exc}",
+                )
+            )
+            return 1
+        if detected:
+            print(
+                localized_text(
+                    language,
+                    "诊断：检测到未由 Agent Compass 记录的框架："
+                    + ", ".join(detected),
+                    "Doctor: detected frameworks not recorded by Agent "
+                    "Compass: "
+                    + ", ".join(detected),
+                )
+            )
+        else:
+            print(
+                localized_text(
+                    language,
+                    "诊断：未找到 Agent Compass 状态或已知框架。",
+                    "Doctor: no Agent Compass state or known framework was found.",
+                )
+            )
         return 1
-    harnesses = [str(item) for item in raw_harnesses]
-    invalid = sorted(set(harnesses) - set(HARNESSES))
-    if invalid:
-        print("诊断失败：状态文件包含不支持的 Agent：" + ", ".join(invalid))
+
+    try:
+        framework, integration, harnesses = validate_recorded_state(
+            state, require_current_schema=False
+        )
+    except BootstrapError as exc:
+        print(
+            localized_text(
+                language,
+                f"诊断失败：{exc}",
+                f"Doctor failed: {exc}",
+            )
+        )
         return 1
 
     schema = state.get("schema", "legacy")
     print(
-        f"记录：schema {schema}；{framework} / {integration} / "
-        f"{', '.join(harnesses)}；状态 {state.get('status', 'unknown')}。"
+        localized_text(
+            language,
+            f"记录：schema {schema}；{framework} / {integration} / "
+            f"{', '.join(harnesses)}；状态 {state.get('status', 'unknown')}。",
+            f"Record: schema {schema}; {framework} / {integration} / "
+            f"{', '.join(harnesses)}; status "
+            f"{state.get('status', 'unknown')}.",
+        )
     )
     readiness = state.get("readiness", {})
+    host_readiness = state.get("host_readiness", {})
     if isinstance(readiness, Mapping) and readiness:
         for key in ("installation", "activation", "bootstrap"):
             if key in readiness:
                 print(f"readiness.{key}: {readiness[key]}")
+
+    if state.get("schema") != STATE_SCHEMA:
+        print(
+            localized_text(
+                language,
+                f"诊断待处理：schema {state.get('schema')} 需要重新 finalize 为 "
+                f"schema {STATE_SCHEMA}。",
+                f"Doctor needs attention: schema {state.get('schema')} must "
+                f"be finalized again as schema {STATE_SCHEMA}.",
+            )
+        )
+        return 1
+
+    try:
+        plugin_inventory = ensure_no_framework_conflicts(
+            root,
+            framework,
+            integration,
+            harnesses,
+            repair=False,
+            dry_run=False,
+            timeout=timeout,
+            finalize=True,
+        )
+    except BootstrapError as exc:
+        print(
+            localized_text(
+                language,
+                f"诊断失败：{exc}",
+                f"Doctor failed: {exc}",
+            )
+        )
+        return 1
+
+    codex_activation_ready = bool(
+        isinstance(host_readiness, Mapping)
+        and isinstance(host_readiness.get("codex"), Mapping)
+        and host_readiness["codex"].get("activation") == "ready"
+    )
+    manual_superpowers_ready = all(
+        isinstance(host_readiness, Mapping)
+        and isinstance(host_readiness.get(harness), Mapping)
+        and host_readiness[harness].get("installation") == "ready"
+        for harness in harnesses
+        if harness != "codex"
+    )
 
     try:
         outcome = finalize_framework(
@@ -2103,35 +3490,133 @@ def doctor_project(root: Path, *, timeout: int) -> int:
             integration,
             dry_run=False,
             timeout=timeout,
-            confirm_trellis_activation=(
-                isinstance(readiness, Mapping)
-                and readiness.get("activation") == "ready"
-            ),
+            confirm_trellis_activation=codex_activation_ready,
             confirm_trellis_bootstrap=(
                 isinstance(readiness, Mapping)
                 and readiness.get("bootstrap") == "ready"
             ),
+            confirm_superpowers_installation=manual_superpowers_ready,
+            plugin_inventory=plugin_inventory,
         )
     except BootstrapError as exc:
-        print(f"诊断失败：{exc}")
+        print(
+            localized_text(
+                language,
+                f"诊断失败：{exc}",
+                f"Doctor failed: {exc}",
+            )
+        )
         return 1
 
     failed = [name for name, ok in outcome.verification.items() if not ok]
+    if state.get("minimal"):
+        outcome.verification["minimal-policy"] = verify_minimal_policy(
+            root, harnesses
+        )
+        failed = [name for name, ok in outcome.verification.items() if not ok]
     if failed:
-        print("诊断失败：验证未通过：" + ", ".join(failed))
+        print(
+            localized_text(
+                language,
+                "诊断失败：验证未通过：" + ", ".join(failed),
+                "Doctor failed: verification did not pass: "
+                + ", ".join(failed),
+            )
+        )
         return 1
-    print("文件与集成检查：通过。")
+    recorded_checksums = state.get("checksums", {})
+    if (
+        not isinstance(recorded_checksums, Mapping)
+        or dict(recorded_checksums) != outcome.checksums
+    ):
+        print(
+            localized_text(
+                language,
+                "诊断失败：记录的 checksums 与当前安装不一致。",
+                "Doctor failed: recorded checksums do not match the current installation.",
+            )
+        )
+        return 1
+    recorded_identities = state.get("identities", {})
+    if (
+        not isinstance(recorded_identities, Mapping)
+        or dict(recorded_identities) != outcome.identities
+    ):
+        print(
+            localized_text(
+                language,
+                "诊断失败：记录的宿主插件身份与当前安装不一致。",
+                "Doctor failed: recorded host-plugin identities do not match "
+                "the current installation.",
+            )
+        )
+        return 1
+    recorded_revisions = state.get("source_revisions", {})
+    if (
+        not isinstance(recorded_revisions, Mapping)
+        or dict(recorded_revisions) != outcome.source_revisions
+    ):
+        print(
+            localized_text(
+                language,
+                "诊断失败：记录的源码修订与精确锁定条目不一致。",
+                "Doctor failed: recorded source revisions do not match the "
+                "exact lock entries.",
+            )
+        )
+        return 1
+    recorded_verification = state.get("verification", {})
+    if (
+        not isinstance(recorded_verification, Mapping)
+        or dict(recorded_verification) != outcome.verification
+    ):
+        print(
+            localized_text(
+                language,
+                "诊断失败：记录的 verification 与当前验证结果不一致。",
+                "Doctor failed: recorded verification does not match the "
+                "current verification result.",
+            )
+        )
+        return 1
+    recorded_versions = state.get("versions", {})
+    if not isinstance(recorded_versions, Mapping) or any(
+        recorded_versions.get(key) != value
+        for key, value in outcome.versions.items()
+    ):
+        print(
+            localized_text(
+                language,
+                "诊断失败：记录的版本与当前可验证版本不一致。",
+                "Doctor failed: recorded versions do not match the currently "
+                "verifiable versions.",
+            )
+        )
+        return 1
 
-    if framework == "trellis" and state.get("schema") != STATE_SCHEMA:
-        print("诊断待处理：旧状态未记录 Trellis activation/bootstrap readiness；请重新 finalize。")
-        return 1
+    print(
+        localized_text(
+            language,
+            "文件、状态与集成检查：通过。",
+            "Files, state, and integration checks: passed.",
+        )
+    )
     if outcome.status != "ready" or state.get("status") != "ready":
-        print(f"诊断待处理：当前阶段为 {outcome.status}。")
+        print(
+            localized_text(
+                language,
+                f"诊断待处理：当前阶段为 {outcome.status}。",
+                f"Doctor needs attention: current phase is {outcome.status}.",
+            )
+        )
         for action in outcome.pending_actions:
-            print(f"待完成：{action}")
+            print(
+                localized_text(language, "待完成：", "Pending: ")
+                + localized_outcome_message(action, language)
+            )
         return 1
 
-    print("诊断结果：ready。")
+    print(localized_text(language, "诊断结果：ready。", "Doctor result: ready."))
     return 0
 
 
@@ -2140,12 +3625,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.timeout <= 0:
         raise BootstrapError("--timeout 必须大于 0。")
+    language = detect_prompt_language(args.language)
 
     root = find_project_root(args.project_root)
     reject_retired_name_traces(root)
-    previous_state = load_state(root)
     requested_framework = canonical_framework(args.framework)
-    interactive_minimal = False
 
     if args.doctor:
         if requested_framework != "auto":
@@ -2162,40 +3646,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.minimal,
                 args.confirm_trellis_activation,
                 args.confirm_trellis_bootstrap,
+                args.confirm_superpowers_installation,
                 args.yes,
                 args.dry_run,
             )
         ):
-            raise BootstrapError("--doctor 只接受 --project-root 和 --timeout。")
-        return doctor_project(root, timeout=args.timeout)
+            raise BootstrapError(
+                "--doctor 只接受 --project-root、--timeout 和 --language。"
+            )
+        return doctor_project(root, timeout=args.timeout, language=language)
 
-    if (
-        args.confirm_trellis_activation or args.confirm_trellis_bootstrap
-    ) and not args.finalize:
-        raise BootstrapError("Trellis 确认参数只能与 --finalize 一起使用。")
+    previous_state = load_state(root)
+    interactive_minimal = False
 
     if args.finalize and requested_framework == "auto":
-        recorded = (
-            canonical_framework(
-                str(previous_state.get("framework") or "")
-            )
-            if previous_state
-            else ""
-        )
-        if recorded not in FRAMEWORKS or recorded in {"auto", "none"}:
+        if not previous_state:
             raise BootstrapError(
                 "--finalize 需要显式框架，或一个有效的 Agent Compass 状态文件。"
             )
-        framework = recorded
+        framework, _, _ = validate_recorded_state(
+            previous_state, require_current_schema=False
+        )
     elif requested_framework == "auto":
-        framework, interactive_minimal = choose_framework_interactively()
+        framework, interactive_minimal = choose_framework_interactively(
+            args.language
+        )
     else:
         framework = requested_framework
-
-    if (
-        args.confirm_trellis_activation or args.confirm_trellis_bootstrap
-    ) and framework != "trellis":
-        raise BootstrapError("Trellis 确认参数只适用于 trellis。")
 
     minimal_enabled = bool(
         args.minimal
@@ -2208,30 +3685,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     if framework == "none":
-        if args.minimal or interactive_minimal:
-            raise BootstrapError(
-                "`none` 表示完全跳过；要启用最小修改规则，请同时选择一个框架。"
-            )
+        validate_option_scope(args, framework, None)
         if previous_state:
             print(
-                "未执行安装；`none` 仅表示跳过本次操作，不会禁用或删除现有框架。"
-                f" 当前记录：{previous_state.get('framework')} / "
-                f"{previous_state.get('status', 'unknown')}。"
+                localized_text(
+                    language,
+                    "未执行安装；`none` 仅表示跳过本次操作，不会禁用或删除现有框架。"
+                    f" 当前记录：{previous_state.get('framework')} / "
+                    f"{previous_state.get('status', 'unknown')}。",
+                    "No installation ran; `none` skips this operation and does "
+                    "not disable or remove the existing framework. Current "
+                    f"record: {previous_state.get('framework')} / "
+                    f"{previous_state.get('status', 'unknown')}.",
+                )
             )
         else:
-            print("未执行安装，项目保持不变。")
+            print(
+                localized_text(
+                    language,
+                    "未执行安装，项目保持不变。",
+                    "No installation ran; the project is unchanged.",
+                )
+            )
         return 0
 
-    if args.finalize and not args.harness and previous_state:
-        recorded_harnesses = previous_state.get("harnesses")
-        if isinstance(recorded_harnesses, list) and recorded_harnesses:
-            harnesses = normalize_harnesses(
-                [str(item) for item in recorded_harnesses], root
-            )
-        else:
-            harnesses = normalize_harnesses(args.harness, root)
+    if not args.harness and previous_state and canonical_framework(
+        str(previous_state.get("framework") or "")
+    ) == framework:
+        _, _, recorded_harnesses = validate_recorded_state(
+            previous_state, require_current_schema=False
+        )
+        harnesses = list(recorded_harnesses)
     else:
-        harnesses = normalize_harnesses(args.harness, root)
+        harnesses = normalize_harnesses(
+            args.harness, root, language=language
+        )
 
     if (
         args.finalize
@@ -2247,6 +3735,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             framework, args.integration, harnesses
         )
 
+    validate_option_scope(args, framework, integration)
+    harnesses = merge_recorded_harnesses(
+        previous_state,
+        framework,
+        integration,
+        harnesses,
+    )
+    validate_confirmation_hosts(args, harnesses)
+
     if (
         framework in {"trellis", "openspec"}
         and args.integration == "project-skills"
@@ -2257,143 +3754,216 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Matt 在本选择器中使用可编辑、可验证的 project-skills 模式。"
         )
 
-    existing = detect_existing_frameworks(root, repair=args.repair)
-    codex_plugins: set[str] = set()
-    if "codex" in harnesses:
-        codex_plugins = detect_codex_plugin_frameworks(
-            root,
-            dry_run=args.dry_run,
-            timeout=args.timeout,
-        )
-        existing.update(codex_plugins)
-    conflicts = existing - {framework}
-    if conflicts:
-        legacy = conflicts & LEGACY_FRAMEWORKS
-        suffix = (
-            " 其中包含已从 v0.5 移除的遗留框架，请先按其官方方式卸载或迁移。"
-            if legacy
-            else ""
-        )
-        raise BootstrapError(
-            "检测到其他框架："
-            + ", ".join(sorted(conflicts))
-            + "。本工具不会自动删除或混用；请先人工处理后重试。"
-            + suffix
-        )
-
-    validate_integration_consistency(
+    plugin_inventory = ensure_no_framework_conflicts(
         root,
         framework,
         integration,
-        detected_codex_plugins=codex_plugins,
+        harnesses,
+        repair=args.repair,
+        dry_run=args.dry_run,
+        timeout=args.timeout,
         finalize=args.finalize,
     )
 
-    print(f"项目：{root}")
+    print(localized_text(language, f"项目：{root}", f"Project: {root}"))
     print(
         describe_plan(
             framework,
             integration,
             harnesses,
             minimal=minimal_enabled,
+            language=language,
         )
     )
     if framework == "trellis":
         print(
-            "许可证提示：Trellis 为 AGPL-3.0；"
-            "请自行确认企业或客户项目的合规要求。"
+            localized_text(
+                language,
+                "许可证提示：Trellis 为 AGPL-3.0；"
+                "请自行确认企业或客户项目的合规要求。",
+                "License notice: Trellis is AGPL-3.0; confirm compliance "
+                "requirements for enterprise or client projects.",
+            )
         )
     if integration == "official" and framework == "superpowers":
         print(
-            "范围提示：官方宿主插件通常安装到用户/宿主范围，"
-            "而不是只写入当前仓库。"
+            localized_text(
+                language,
+                "范围提示：官方宿主插件通常安装到用户/宿主范围，"
+                "而不是只写入当前仓库。",
+                "Scope notice: official host plugins are usually installed at "
+                "user/host scope, not only inside this repository.",
+            )
         )
     if not args.yes and not args.dry_run:
-        if not prompt_yes_no("继续吗？"):
-            print("已取消。")
+        if not prompt_yes_no(
+            "继续吗？" if language == "zh" else "Continue?",
+            language=language,
+        ):
+            print(localized_text(language, "已取消。", "Cancelled."))
             return 0
 
     mutation_tracker = MutationTracker()
+    written_state: dict[str, Any]
     try:
-        with ManagedFileTransaction(root) as transaction:
-            if args.finalize:
+        with RepositoryLock(root, enabled=not args.dry_run):
+            if not args.dry_run:
+                locked_state = load_state(root)
+                if locked_state != previous_state:
+                    raise BootstrapError(
+                        "Agent Compass 状态在确认期间已变化；"
+                        "为避免基于过期状态覆盖，请重新运行。"
+                    )
+                plugin_inventory = ensure_no_framework_conflicts(
+                    root,
+                    framework,
+                    integration,
+                    harnesses,
+                    repair=args.repair,
+                    dry_run=False,
+                    timeout=args.timeout,
+                    finalize=args.finalize,
+                )
+            with ManagedFileTransaction(root) as transaction:
                 previous_readiness = (
                     previous_state.get("readiness", {})
                     if previous_state
+                    and previous_state.get("schema") == STATE_SCHEMA
                     else {}
                 )
-                outcome = finalize_framework(
-                    root,
-                    framework,
-                    harnesses,
-                    integration,
-                    dry_run=args.dry_run,
-                    timeout=args.timeout,
-                    confirm_trellis_activation=(
-                        args.confirm_trellis_activation
-                        or (
-                            isinstance(previous_readiness, Mapping)
-                            and previous_readiness.get("activation") == "ready"
-                        )
-                    ),
-                    confirm_trellis_bootstrap=(
-                        args.confirm_trellis_bootstrap
-                        or (
-                            isinstance(previous_readiness, Mapping)
-                            and previous_readiness.get("bootstrap") == "ready"
-                        )
-                    ),
+                previous_host_readiness = (
+                    previous_state.get("host_readiness", {})
+                    if previous_state
+                    and previous_state.get("schema") == STATE_SCHEMA
+                    else {}
                 )
-            else:
-                outcome = install_framework(
-                    root,
-                    framework,
-                    harnesses,
-                    integration,
-                    args,
-                    transaction,
-                    mutation_tracker,
+                previous_codex_ready = bool(
+                    isinstance(previous_host_readiness, Mapping)
+                    and isinstance(previous_host_readiness.get("codex"), Mapping)
+                    and previous_host_readiness["codex"].get("activation") == "ready"
                 )
+                previous_manual_superpowers_ready = all(
+                    isinstance(previous_host_readiness, Mapping)
+                    and isinstance(previous_host_readiness.get(harness), Mapping)
+                    and previous_host_readiness[harness].get("installation") == "ready"
+                    for harness in harnesses
+                    if harness != "codex"
+                )
+                if args.finalize:
+                    outcome = finalize_framework(
+                        root,
+                        framework,
+                        harnesses,
+                        integration,
+                        dry_run=args.dry_run,
+                        timeout=args.timeout,
+                        confirm_trellis_activation=(
+                            args.confirm_trellis_activation
+                            or previous_codex_ready
+                        ),
+                        confirm_trellis_bootstrap=(
+                            args.confirm_trellis_bootstrap
+                            or (
+                                isinstance(previous_readiness, Mapping)
+                                and previous_readiness.get("bootstrap") == "ready"
+                            )
+                        ),
+                        confirm_superpowers_installation=(
+                            args.confirm_superpowers_installation
+                            or previous_manual_superpowers_ready
+                        ),
+                        plugin_inventory=plugin_inventory,
+                    )
+                else:
+                    outcome = install_framework(
+                        root,
+                        framework,
+                        harnesses,
+                        integration,
+                        args,
+                        transaction,
+                        mutation_tracker,
+                        plugin_inventory=plugin_inventory,
+                    )
 
-            if minimal_enabled:
-                managed = write_minimal_instruction(
+                if minimal_enabled:
+                    managed = write_minimal_instruction(
+                        root,
+                        harnesses,
+                        dry_run=args.dry_run,
+                        transaction=transaction,
+                    )
+                    outcome.created_or_managed.extend(managed)
+                    outcome.verification["minimal-policy"] = True
+
+                written_state = write_state(
                     root,
+                    outcome,
                     harnesses,
+                    minimal=minimal_enabled,
                     dry_run=args.dry_run,
                     transaction=transaction,
                 )
-                outcome.created_or_managed.extend(managed)
-                outcome.verification["minimal-policy"] = True
-
-            write_state(
-                root,
-                outcome,
-                harnesses,
-                minimal=minimal_enabled,
-                dry_run=args.dry_run,
-                transaction=transaction,
-            )
-            transaction.commit()
-    except Exception:
+                transaction.commit()
+    except BaseException:
         if mutation_tracker.external_command_started:
             print(
-                "警告：上游安装命令已运行，可能留下部分更改；"
-                "Agent Compass 自己管理的文件已尝试回滚，且不会写入 ready 状态。"
-                "请检查 git diff 和宿主插件列表。",
+                localized_text(
+                    language,
+                    "警告：上游安装命令已运行，可能留下部分更改；"
+                    "Agent Compass 自己管理的文件已尝试回滚，且不会写入 ready 状态。"
+                    "请检查 git diff 和宿主插件列表。",
+                    "Warning: an upstream installer ran and may have left "
+                    "partial changes. Agent-Compass-managed files were rolled "
+                    "back where possible, and no ready state was written. "
+                    "Inspect git diff and the host plugin inventory.",
+                ),
                 file=sys.stderr,
             )
         raise
 
-    if outcome.status == "ready":
-        print("安装与验证完成。")
+    if args.dry_run:
+        print(
+            localized_text(
+                language,
+                "阶段：not_installed（dry-run）；未执行安装、未写入状态，"
+                "也未验证或宣称 ready。",
+                "Phase: not_installed (dry-run); no installation ran, no state "
+                "was written, and readiness remains unverified.",
+            )
+        )
+    elif written_state["status"] == "ready":
+        print(
+            localized_text(
+                language,
+                "安装与验证完成；阶段：ready。",
+                "Installation and verification completed; phase: ready.",
+            )
+        )
     else:
-        print(f"安装阶段完成，当前状态为 {outcome.status}；未宣称 ready。")
+        print(
+            localized_text(
+                language,
+                f"安装阶段完成，当前状态为 {written_state['status']}；未宣称 ready。",
+                f"Installation phase completed; current phase: "
+                f"{written_state['status']}. Readiness was not claimed.",
+            )
+        )
     for note in outcome.pending_actions:
-        print(f"待完成：{note}")
+        print(
+            localized_text(language, "待完成：", "Pending: ")
+            + localized_outcome_message(note, language)
+        )
     for note in outcome.activation_notes:
-        print(f"激活提示：{note}")
+        print(
+            localized_text(language, "激活提示：", "Activation: ")
+            + localized_outcome_message(note, language)
+        )
     for limitation in outcome.limitations:
-        print(f"能力边界：{limitation}")
+        print(
+            localized_text(language, "能力边界：", "Limitation: ")
+            + localized_outcome_message(limitation, language)
+        )
     return 0
 
 

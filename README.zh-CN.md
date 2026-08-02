@@ -4,7 +4,7 @@
 
 选择你的编码 Agent 应该如何工作。Agent Compass 会先判断项目是否真的需要框架，再按实际需求选择四种受支持方案中的一种、验证安装结果，并诚实记录就绪状态。
 
-## v0.6.0 支持的框架
+## v0.6.1 支持的框架
 
 | 你的需求 | 框架 |
 |---|---|
@@ -18,6 +18,8 @@ Spec Kit、BMAD、Compound Engineering 和 Ponytail 已被移除，因为它们�
 ## 安装 Agent Compass
 
 旧的 Skill 名称和斜杠命令均已停用，且不提供兼容别名。请仅使用 `agent-compass` 和 `/agent-compass`。安装前必须明确处理检测到的旧版文件。
+
+bootstrapper 需要 Python 3.10 或更高版本。安装项目级 Skills 或 Trellis 需要 Node.js 18 或更高版本；OpenSpec 需要 Node.js 20.19 或更高版本。
 
 在解压后的目录中运行：
 
@@ -40,13 +42,13 @@ npx skills@1.5.9 add /path/to/agent-compass \
 Agent Compass 会询问：
 
 ```text
-这个项目是否需要长期维护或严格工程流程？
+这个任务是否同时满足：一次性、低风险、无需严格工程流程？
 
-1. 否，只是短期、低风险或一次性任务
-2. 是，或者我还不确定
+1. 是，三项都满足
+2. 否，任一项不满足，或者我不确定
 ```
 
-短期低风险任务默认不安装框架。其他情况继续询问：
+只有答案 1 才会跳过框架选择；复杂或较高风险的一次性任务仍可以选择 Superpowers。其他情况继续询问：
 
 ```text
 你最想解决哪类问题？
@@ -58,7 +60,7 @@ Agent Compass 会询问：
 5. 仍然不安装任何框架
 ```
 
-选择 1–4 后，它还会询问 AI 是否应默认采用最小必要改动。
+选择 1–4 后，它还会询问 AI 是否应默认采用最小必要改动。问卷、操作摘要、完成阶段与 doctor 输出默认跟随系统 locale，也可使用 `--language zh` 或 `--language en` 显式指定。
 
 也可以直接指定框架：
 
@@ -80,7 +82,7 @@ Agent Compass 会询问：
 
 ### Matt Pocock Skills
 
-安装六个精选的项目级 Skills，并将状态记录为 `pending`。运行 `setup-matt-pocock-skills` 后，再执行：
+先解析一个上游提交，在临时目录精确检出该修订，只安装六个精选的项目级 Skills，并将远程来源与 commit 回写到 `skills-lock.json`。随后将状态记录为 `pending`。运行 `setup-matt-pocock-skills` 后，再执行：
 
 ```bash
 python3 skills/agent-compass/scripts/compass_bootstrap.py matt \
@@ -92,7 +94,7 @@ python3 skills/agent-compass/scripts/compass_bootstrap.py matt \
 
 ### OpenSpec
 
-解析并固定 `@fission-ai/openspec` 的准确版本，为选定宿主完成初始化，然后验证 OpenSpec 目录及生成的 Skills。
+解析并固定 `@fission-ai/openspec` 的准确版本，为选定宿主完成初始化，然后验证真实的 `openspec-*/SKILL.md` 产物并记录 checksum。显式传入版本时，会拒绝 dist-tag 和版本范围。
 
 ### Trellis
 
@@ -119,7 +121,21 @@ python3 skills/agent-compass/scripts/compass_bootstrap.py trellis \
 
 ### Superpowers
 
-仅选择 Codex 时使用官方 Codex 插件。其他宿主默认使用项目级 Skills；项目级模式会明确标记为兼容性回退，不会声称支持官方插件钩子。
+仅选择 Codex 时使用 `superpowers@openai-curated` 插件；自定义 Marketplace 中的同名插件不会被当作官方集成。其他宿主默认从一个精确上游 commit 安装明确白名单中的项目级 Skills，lock 中会记录同一来源与修订。项目级模式会明确标记为兼容性回退，不会声称支持官方插件钩子。
+
+如果为非 Codex 宿主显式选择 official 模式，Agent Compass 会保持 `pending`，直到用户在宿主内完成安装并显式确认：
+
+```bash
+python3 skills/agent-compass/scripts/compass_bootstrap.py superpowers \
+  --project-root . \
+  --harness cursor \
+  --integration official \
+  --finalize \
+  --confirm-superpowers-installation \
+  --yes
+```
+
+由于 Agent Compass 无法机器验证该宿主状态，这一确认会被记录为“用户声明”。
 
 ## 只读健康检查
 
@@ -128,26 +144,31 @@ python3 skills/agent-compass/scripts/compass_bootstrap.py trellis \
 ```bash
 python3 skills/agent-compass/scripts/compass_bootstrap.py \
   --project-root . \
-  --doctor
+  --doctor \
+  --language zh
 ```
 
-只有已记录且验证为 `ready` 的安装返回 0。状态缺失、旧版 Trellis 状态、未完成门槛或验证失败均返回 1。
+只有结构有效、无框架冲突、已记录为 `ready`，且当前产物、checksum、插件身份与托管规则都与状态匹配时才返回 0。状态缺失或过旧、仓库锁存在、框架混装、产物被篡改、门槛未完成或验证失败均返回 1。`--language` 是唯一可与 `--doctor` 组合的非诊断行为参数；它只改变输出语言，不改变任何状态。
 
 ## 安全特性
 
 - 每个仓库只允许一个主要框架
 - 不自动卸载或迁移已有框架
 - 检测旧框架冲突
-- 拒绝符号链接和路径逃逸
+- 上游安装器运行前递归拒绝符号链接和路径逃逸
 - 对 Agent Compass 管理的文件执行原子写入
 - 失败时回滚 Agent Compass 管理的文件
-- 记录准确版本或修订号
+- 记录准确 semver，通过精确源码检出/lock 固定修订，并记录插件身份和产物 checksum
 - 安装后验证通过才标记为 `ready`
 - 支持多宿主验证
+- 按宿主记录 readiness，不能通过只 finalize 某个宿主绕过其他宿主的确认
 - Trellis 分阶段就绪状态，不误报成功
-- 只读健康诊断
+- Codex 插件冲突检测失败时停止，不假设“未安装”
+- 仓库变更锁，以及获锁后的第二次冲突检查
+- dry-run 明确报告 `not_installed`，不写状态，不声称已安装或已就绪
+- 只读且可检测篡改的健康诊断
 
-状态保存在 schema 版本为 6 的 `.agent-compass.json` 中，同时兼容读取 schema 5。
+状态保存在 schema 版本为 7 的 `.agent-compass.json` 中。schema 5 和 6 仅保留迁移读取能力，必须 finalize 为 schema 7 后，健康检查才可能报告 `ready`。
 
 ## 开发
 
