@@ -29,7 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
+STATE_SCHEMA = 6
 SKILLS_CLI_VERSION = "1.5.9"
 TRELLIS_PACKAGE = "@mindfoldhq/trellis"
 OPENSPEC_PACKAGE = "@fission-ai/openspec"
@@ -175,7 +176,8 @@ class CommandResult:
 class InstallOutcome:
     framework: str
     integration: str
-    status: str = "ready"  # ready | pending
+    status: str = "ready"
+    readiness: dict[str, str] = field(default_factory=dict)
     created_or_managed: list[str] = field(default_factory=list)
     versions: dict[str, str] = field(default_factory=dict)
     source_revisions: dict[str, str] = field(default_factory=dict)
@@ -367,15 +369,25 @@ def prompt_choice(question: str, options: Sequence[str]) -> int:
 
 
 def choose_framework_interactively() -> tuple[str, bool]:
-    """Choose one primary workflow using plain collaboration language."""
-    choice = prompt_choice(
-        "你希望 AI 主要怎么工作？",
+    """Choose one primary workflow after checking whether one is warranted."""
+    project_fit = prompt_choice(
+        "这个项目是否需要长期维护或严格工程流程？",
         (
-            "我来主导，AI 按需帮我",
-            "AI 先给方案，我确认后再做",
-            "AI 长期记住这个项目的规则",
-            "AI 自己规划并完成整个任务",
-            "不安装任何框架",
+            "否，只是短期、低风险或一次性任务",
+            "是，或者我还不确定",
+        ),
+    )
+    if project_fit == 1:
+        return "none", False
+
+    choice = prompt_choice(
+        "你最想解决哪类问题？",
+        (
+            "由我主导，按需调用调试、评审和 TDD Skills",
+            "每次变更先形成可评审的规格，再开始实现",
+            "跨会话接续项目规范、任务进度和设计决策",
+            "让单次复杂任务遵循严格的规划、实现和验证流程",
+            "仍然不安装任何框架",
         ),
     )
     framework = {
@@ -392,6 +404,33 @@ def choose_framework_interactively() -> tuple[str, bool]:
             default=False,
         )
     return framework, minimal
+
+
+def trellis_status_from_readiness(readiness: Mapping[str, str]) -> str:
+    activation = readiness.get("activation", "unknown")
+    bootstrap = readiness.get("bootstrap", "unknown")
+    if activation == "pending":
+        return "activation_pending"
+    if bootstrap == "pending":
+        return "bootstrap_pending"
+    if activation == "unknown" or bootstrap == "unknown":
+        return "installed"
+    return "ready"
+
+
+def set_trellis_readiness(
+    outcome: InstallOutcome,
+    *,
+    activation: str,
+    bootstrap: str,
+) -> None:
+    """Set Trellis readiness without collapsing unverifiable user actions."""
+    outcome.readiness = {
+        "installation": "ready",
+        "activation": activation,
+        "bootstrap": bootstrap,
+    }
+    outcome.status = trellis_status_from_readiness(outcome.readiness)
 
 
 def canonical_framework(value: str) -> str:
@@ -473,6 +512,7 @@ def run(
     dry_run: bool,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     env: Mapping[str, str] | None = None,
+    echo_output: bool = True,
 ) -> CommandResult:
     printable = shlex.join(str(item) for item in command)
     print(f"$ {printable}")
@@ -498,9 +538,9 @@ def run(
     except OSError as exc:
         raise BootstrapError(f"无法执行命令：{printable}：{exc}") from exc
 
-    if completed.stdout:
+    if completed.stdout and echo_output:
         print(completed.stdout, end="")
-    if completed.stderr:
+    if completed.stderr and echo_output:
         print(completed.stderr, end="", file=sys.stderr)
     if completed.returncode != 0:
         raise BootstrapError(f"命令失败（退出码 {completed.returncode}）：{printable}")
@@ -1192,8 +1232,23 @@ def install_trellis(
             raise BootstrapError(f"Trellis 初始化后缺少预期{kind}：{name}")
     outcome.created_or_managed.extend(sorted(required))
     outcome.limitations.append("Trellis 以 AGPL-3.0 发布；企业或客户仓库使用前应确认内部合规要求。")
-    if "codex" in harnesses:
-        outcome.activation_notes.append("在 Codex 中启用 hooks，并在 `/hooks` 审核 Trellis Hook。")
+    activation = "pending" if "codex" in harnesses else "ready"
+    bootstrap = "pending" if not existing_valid else "unknown"
+    set_trellis_readiness(
+        outcome,
+        activation=activation,
+        bootstrap=bootstrap,
+    )
+    if activation == "pending":
+        outcome.pending_actions.append(
+            "在 Codex 中启用 hooks，并通过 `/hooks` 审核 Trellis Hook；"
+            "完成后使用 --finalize --confirm-trellis-activation。"
+        )
+    if bootstrap != "ready":
+        outcome.pending_actions.append(
+            "完成 Trellis 的 00-bootstrap-guidelines，从真实代码生成首版 spec；"
+            "确认后使用 --finalize --confirm-trellis-bootstrap。"
+        )
     return outcome
 
 
@@ -1284,6 +1339,36 @@ def codex_plugin_entries(data: Any) -> list[dict[str, Any]]:
     return entries
 
 
+def parse_codex_plugin_list(raw: str) -> dict[str, list[dict[str, Any]]]:
+    """Parse the human-readable inventory emitted by current Codex CLIs."""
+    entries: list[dict[str, Any]] = []
+    marketplace = ""
+    for line in raw.splitlines():
+        marketplace_match = re.fullmatch(r"Marketplace `([^`]+)`", line.strip())
+        if marketplace_match:
+            marketplace = marketplace_match.group(1)
+            continue
+        plugin_match = re.fullmatch(
+            r"\s{2}(.+?)@([^\s]+) \((installed|not installed), "
+            r"(enabled|disabled)\)",
+            line,
+        )
+        if not plugin_match:
+            continue
+        name, listed_marketplace, installed, enabled = plugin_match.groups()
+        effective_marketplace = marketplace or listed_marketplace
+        entries.append(
+            {
+                "name": name,
+                "pluginId": f"{name}@{effective_marketplace}",
+                "marketplaceName": effective_marketplace,
+                "installed": installed == "installed",
+                "enabled": enabled == "enabled",
+            }
+        )
+    return {"plugins": entries}
+
+
 def plugin_name(entry: Mapping[str, Any]) -> str:
     return str(entry.get("name") or entry.get("pluginId") or entry.get("id") or "")
 
@@ -1313,11 +1398,30 @@ def find_codex_plugin(data: Any, framework: str, *, installed_only: bool = False
 
 def codex_plugin_inventory(root: Path, *, dry_run: bool, timeout: int, include_available: bool) -> Any:
     require_executable("codex")
-    command = ["codex", "plugin", "list"]
+    result = run(
+        ("codex", "plugin", "list"),
+        cwd=root,
+        dry_run=dry_run,
+        timeout=timeout,
+        echo_output=False,
+    )
+    if dry_run:
+        return {}
+    raw = result.stdout.strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = parse_codex_plugin_list(raw)
+    if not codex_plugin_entries(data):
+        raise BootstrapError("Codex 插件清单格式无法识别。")
     if include_available:
-        command.append("--available")
-    command.append("--json")
-    return run_json(command, cwd=root, dry_run=dry_run, timeout=timeout)
+        return data
+    installed = [
+        entry
+        for entry in codex_plugin_entries(data)
+        if entry.get("installed") is True
+    ]
+    return {"plugins": installed}
 
 
 
@@ -1336,11 +1440,10 @@ def detect_codex_plugin_frameworks(
             file=sys.stderr,
         )
         return set()
-    return {
-        "superpowers"
-        for _ in [0]
-        if find_codex_plugin(data, "superpowers", installed_only=True)
-    }
+    entry = find_codex_plugin(data, "superpowers", installed_only=True)
+    if entry and bool(entry.get("enabled", True)):
+        return {"superpowers"}
+    return set()
 
 
 
@@ -1381,15 +1484,13 @@ def install_codex_plugin(
     )
     if not installed_entry:
         mutation_tracker.mark(dry_run=dry_run)
-        result = run_json(
-            ("codex", "plugin", "add", plugin_spec, "--json"),
+        run(
+            ("codex", "plugin", "add", plugin_spec),
             cwd=root,
             dry_run=dry_run,
             timeout=timeout,
         )
         outcome.external_commands_ran = not dry_run
-        if isinstance(result, Mapping) and result.get("version"):
-            outcome.versions[framework] = str(result["version"])
 
     if dry_run:
         outcome.verification["codex-plugin:superpowers"] = True
@@ -1542,6 +1643,8 @@ def finalize_framework(
     *,
     dry_run: bool,
     timeout: int,
+    confirm_trellis_activation: bool = False,
+    confirm_trellis_bootstrap: bool = False,
 ) -> InstallOutcome:
     outcome = InstallOutcome(framework=framework, integration=integration)
     if framework == "matt":
@@ -1585,6 +1688,27 @@ def finalize_framework(
                     raise BootstrapError(
                         f"Trellis 平台配置缺失或类型错误：{relative}"
                     )
+        activation = (
+            "ready"
+            if "codex" not in harnesses or confirm_trellis_activation
+            else "pending"
+        )
+        bootstrap = "ready" if confirm_trellis_bootstrap else "pending"
+        set_trellis_readiness(
+            outcome,
+            activation=activation,
+            bootstrap=bootstrap,
+        )
+        if activation == "pending":
+            outcome.pending_actions.append(
+                "启用 Codex hooks 并通过 `/hooks` 审批后，"
+                "使用 --finalize --confirm-trellis-activation。"
+            )
+        if bootstrap == "pending":
+            outcome.pending_actions.append(
+                "完成 00-bootstrap-guidelines 后，"
+                "使用 --finalize --confirm-trellis-bootstrap。"
+            )
         return outcome
 
     if framework == "openspec":
@@ -1679,6 +1803,14 @@ def state_payload(
             dict.fromkeys([*(str(item) for item in prior), *current])
         )
 
+    def merged_readiness() -> dict[str, str]:
+        base = previous.get("readiness", {}) if same_selection and previous else {}
+        merged = dict(base) if isinstance(base, Mapping) else {}
+        for key, value in outcome.readiness.items():
+            if value != "unknown" or key not in merged:
+                merged[key] = value
+        return {str(key): str(value) for key, value in merged.items()}
+
     prior_harnesses = (
         previous.get("harnesses", []) if same_selection and previous else []
     )
@@ -1697,11 +1829,20 @@ def state_payload(
     first_installed = (
         previous.get("installed_at") if same_selection and previous else None
     )
-    prior_minimal = bool(previous.get("minimal", False)) if same_selection and previous else False
+    prior_minimal = (
+        bool(previous.get("minimal", False))
+        if same_selection and previous
+        else False
+    )
+    readiness = merged_readiness()
+    effective_status = outcome.status
+    if outcome.framework == "trellis":
+        effective_status = trellis_status_from_readiness(readiness)
     return {
-        "schema": 5,
+        "schema": STATE_SCHEMA,
         "installer": f"agent-compass/{VERSION}",
-        "status": outcome.status,
+        "status": effective_status,
+        "readiness": readiness,
         "framework": outcome.framework,
         "integration": outcome.integration,
         "harnesses": effective_harnesses,
@@ -1753,7 +1894,8 @@ def write_state(
     state = state_payload(
         outcome, harnesses, previous, minimal=minimal
     )
-    print(f"write {STATE_FILE} ({outcome.status})")
+    state_status = str(state["status"])
+    print(f"write {STATE_FILE} ({state_status})")
     if not dry_run:
         transaction.snapshot(path)
         mode = (
@@ -1768,7 +1910,7 @@ def write_state(
             mode=mode,
         )
         reread = load_state(root)
-        if not reread or reread.get("status") != outcome.status:
+        if not reread or reread.get("status") != state_status:
             raise BootstrapError("状态文件写入后验证失败。")
 
 
@@ -1813,6 +1955,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=FRAMEWORK_CHOICES,
     )
     parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Read-only health check for the recorded Agent Compass setup",
+    )
+    parser.add_argument(
         "--harness",
         action="append",
         help="Repeat or comma-separate: codex, claude-code, cursor, opencode",
@@ -1853,6 +2000,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--finalize",
         action="store_true",
         help="Verify a pending/manual initialization and mark it ready",
+    )
+    parser.add_argument(
+        "--confirm-trellis-activation",
+        action="store_true",
+        help="With --finalize, confirm Trellis host activation is complete",
+    )
+    parser.add_argument(
+        "--confirm-trellis-bootstrap",
+        action="store_true",
+        help="With --finalize, confirm the initial Trellis spec bootstrap is complete",
     )
     parser.add_argument(
         "--yes",
@@ -1896,6 +2053,88 @@ def describe_plan(
     )
 
 
+def doctor_project(root: Path, *, timeout: int) -> int:
+    """Verify recorded setup without modifying project or host state."""
+    state = load_state(root)
+    print(f"项目：{root}")
+    if not state:
+        try:
+            detected = sorted(detect_existing_frameworks(root))
+        except BootstrapError as exc:
+            print(f"诊断失败：{exc}")
+            return 1
+        if detected:
+            print("诊断：检测到未由 Agent Compass 记录的框架：" + ", ".join(detected))
+        else:
+            print("诊断：未找到 Agent Compass 状态或已知框架。")
+        return 1
+
+    framework = canonical_framework(str(state.get("framework") or ""))
+    integration = str(state.get("integration") or "")
+    raw_harnesses = state.get("harnesses", [])
+    if framework not in FRAMEWORKS or framework in {"auto", "none"}:
+        print("诊断失败：状态文件中的 framework 无效。")
+        return 1
+    if not isinstance(raw_harnesses, list) or not raw_harnesses:
+        print("诊断失败：状态文件没有有效的 harnesses。")
+        return 1
+    harnesses = [str(item) for item in raw_harnesses]
+    invalid = sorted(set(harnesses) - set(HARNESSES))
+    if invalid:
+        print("诊断失败：状态文件包含不支持的 Agent：" + ", ".join(invalid))
+        return 1
+
+    schema = state.get("schema", "legacy")
+    print(
+        f"记录：schema {schema}；{framework} / {integration} / "
+        f"{', '.join(harnesses)}；状态 {state.get('status', 'unknown')}。"
+    )
+    readiness = state.get("readiness", {})
+    if isinstance(readiness, Mapping) and readiness:
+        for key in ("installation", "activation", "bootstrap"):
+            if key in readiness:
+                print(f"readiness.{key}: {readiness[key]}")
+
+    try:
+        outcome = finalize_framework(
+            root,
+            framework,
+            harnesses,
+            integration,
+            dry_run=False,
+            timeout=timeout,
+            confirm_trellis_activation=(
+                isinstance(readiness, Mapping)
+                and readiness.get("activation") == "ready"
+            ),
+            confirm_trellis_bootstrap=(
+                isinstance(readiness, Mapping)
+                and readiness.get("bootstrap") == "ready"
+            ),
+        )
+    except BootstrapError as exc:
+        print(f"诊断失败：{exc}")
+        return 1
+
+    failed = [name for name, ok in outcome.verification.items() if not ok]
+    if failed:
+        print("诊断失败：验证未通过：" + ", ".join(failed))
+        return 1
+    print("文件与集成检查：通过。")
+
+    if framework == "trellis" and state.get("schema") != STATE_SCHEMA:
+        print("诊断待处理：旧状态未记录 Trellis activation/bootstrap readiness；请重新 finalize。")
+        return 1
+    if outcome.status != "ready" or state.get("status") != "ready":
+        print(f"诊断待处理：当前阶段为 {outcome.status}。")
+        for action in outcome.pending_actions:
+            print(f"待完成：{action}")
+        return 1
+
+    print("诊断结果：ready。")
+    return 0
+
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
@@ -1907,6 +2146,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     previous_state = load_state(root)
     requested_framework = canonical_framework(args.framework)
     interactive_minimal = False
+
+    if args.doctor:
+        if requested_framework != "auto":
+            raise BootstrapError("--doctor 不接受框架参数；它只读取已记录状态。")
+        if any(
+            (
+                args.harness,
+                args.integration != "auto",
+                args.user,
+                args.trellis_version,
+                args.openspec_version,
+                args.finalize,
+                args.repair,
+                args.minimal,
+                args.confirm_trellis_activation,
+                args.confirm_trellis_bootstrap,
+                args.yes,
+                args.dry_run,
+            )
+        ):
+            raise BootstrapError("--doctor 只接受 --project-root 和 --timeout。")
+        return doctor_project(root, timeout=args.timeout)
+
+    if (
+        args.confirm_trellis_activation or args.confirm_trellis_bootstrap
+    ) and not args.finalize:
+        raise BootstrapError("Trellis 确认参数只能与 --finalize 一起使用。")
 
     if args.finalize and requested_framework == "auto":
         recorded = (
@@ -1925,6 +2191,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         framework, interactive_minimal = choose_framework_interactively()
     else:
         framework = requested_framework
+
+    if (
+        args.confirm_trellis_activation or args.confirm_trellis_bootstrap
+    ) and framework != "trellis":
+        raise BootstrapError("Trellis 确认参数只适用于 trellis。")
 
     minimal_enabled = bool(
         args.minimal
@@ -2046,6 +2317,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with ManagedFileTransaction(root) as transaction:
             if args.finalize:
+                previous_readiness = (
+                    previous_state.get("readiness", {})
+                    if previous_state
+                    else {}
+                )
                 outcome = finalize_framework(
                     root,
                     framework,
@@ -2053,6 +2329,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     integration,
                     dry_run=args.dry_run,
                     timeout=args.timeout,
+                    confirm_trellis_activation=(
+                        args.confirm_trellis_activation
+                        or (
+                            isinstance(previous_readiness, Mapping)
+                            and previous_readiness.get("activation") == "ready"
+                        )
+                    ),
+                    confirm_trellis_bootstrap=(
+                        args.confirm_trellis_bootstrap
+                        or (
+                            isinstance(previous_readiness, Mapping)
+                            and previous_readiness.get("bootstrap") == "ready"
+                        )
+                    ),
                 )
             else:
                 outcome = install_framework(
@@ -2097,7 +2387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if outcome.status == "ready":
         print("安装与验证完成。")
     else:
-        print("安装阶段完成，但初始化仍为 pending；未宣称 ready。")
+        print(f"安装阶段完成，当前状态为 {outcome.status}；未宣称 ready。")
     for note in outcome.pending_actions:
         print(f"待完成：{note}")
     for note in outcome.activation_notes:

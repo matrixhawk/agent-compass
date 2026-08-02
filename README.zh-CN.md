@@ -2,16 +2,16 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-选择你的编码 Agent 应该如何工作。Agent Compass 只用一个自然语言问题了解你的偏好，随后安装四种受支持框架中的一种、验证安装结果，并记录项目状态。
+选择你的编码 Agent 应该如何工作。Agent Compass 会先判断项目是否真的需要框架，再按实际需求选择四种受支持方案中的一种、验证安装结果，并诚实记录就绪状态。
 
-## v0.5.0 保留的框架
+## v0.6.0 支持的框架
 
 | 你的需求 | 框架 |
 |---|---|
-| 由你主导，AI 按需协助 | Matt Pocock Skills |
-| AI 先提出方案，确认后再编码 | OpenSpec |
-| AI 长期记住项目规则 | Trellis |
-| AI 自主规划并完成整个任务 | Superpowers |
+| 按需使用调试、评审、设计和 TDD 能力 | Matt Pocock Skills |
+| 实现前先形成可评审的规格 | OpenSpec |
+| 跨会话保存项目上下文并接续任务 | Trellis |
+| 让复杂任务遵循严格的规划、实现和验证流程 | Superpowers |
 
 Spec Kit、BMAD、Compound Engineering 和 Ponytail 已被移除，因为它们提供的用户价值与上述框架重叠较多。Agent Compass 仍会检测这些框架遗留的文件，并拒绝在存在冲突时继续安装。
 
@@ -40,13 +40,22 @@ npx skills@1.5.9 add /path/to/agent-compass \
 Agent Compass 会询问：
 
 ```text
-你希望 AI 主要怎么工作？
+这个项目是否需要长期维护或严格工程流程？
 
-1. 我来主导，AI 按需帮我
-2. AI 先给方案，我确认后再做
-3. AI 长期记住这个项目的规则
-4. AI 自己规划并完成整个任务
-5. 不安装任何框架
+1. 否，只是短期、低风险或一次性任务
+2. 是，或者我还不确定
+```
+
+短期低风险任务默认不安装框架。其他情况继续询问：
+
+```text
+你最想解决哪类问题？
+
+1. 由我主导，按需调用调试、评审和 TDD Skills
+2. 每次变更先形成可评审的规格，再开始实现
+3. 跨会话接续项目规范、任务进度和设计决策
+4. 让单次复杂任务遵循严格的规划、实现和验证流程
+5. 仍然不安装任何框架
 ```
 
 选择 1–4 后，它还会询问 AI 是否应默认采用最小必要改动。
@@ -89,9 +98,40 @@ python3 skills/agent-compass/scripts/compass_bootstrap.py matt \
 
 解析并固定 `@mindfoldhq/trellis` 的准确版本，为所有指定宿主完成初始化，并验证核心文件与平台文件。它不会全局安装 Trellis。
 
+仅完成文件安装不会再被视为完全就绪。Agent Compass 会记录以下阶段之一：
+
+- `installed`：文件存在，但有就绪门槛无法确定
+- `activation_pending`：仍需完成宿主激活或 Hook 审批
+- `bootstrap_pending`：仍需通过 `00-bootstrap-guidelines` 生成项目专属规范
+- `ready`：安装、激活和 bootstrap 均已完成
+
+在 Codex 中需要启用 hooks，并通过 `/hooks` 审批 Trellis Hook。完成激活和 bootstrap 后显式 finalize：
+
+```bash
+python3 skills/agent-compass/scripts/compass_bootstrap.py trellis \
+  --project-root . \
+  --harness codex \
+  --finalize \
+  --confirm-trellis-activation \
+  --confirm-trellis-bootstrap \
+  --yes
+```
+
 ### Superpowers
 
 仅选择 Codex 时使用官方 Codex 插件。其他宿主默认使用项目级 Skills；项目级模式会明确标记为兼容性回退，不会声称支持官方插件钩子。
+
+## 只读健康检查
+
+在不修改项目或宿主状态的情况下检查当前安装：
+
+```bash
+python3 skills/agent-compass/scripts/compass_bootstrap.py \
+  --project-root . \
+  --doctor
+```
+
+只有已记录且验证为 `ready` 的安装返回 0。状态缺失、旧版 Trellis 状态、未完成门槛或验证失败均返回 1。
 
 ## 安全特性
 
@@ -104,9 +144,10 @@ python3 skills/agent-compass/scripts/compass_bootstrap.py matt \
 - 记录准确版本或修订号
 - 安装后验证通过才标记为 `ready`
 - 支持多宿主验证
-- 区分 `ready` 和 `pending` 状态
+- Trellis 分阶段就绪状态，不误报成功
+- 只读健康诊断
 
-状态保存在 schema 版本为 5 的 `.agent-compass.json` 中。
+状态保存在 schema 版本为 6 的 `.agent-compass.json` 中，同时兼容读取 schema 5。
 
 ## 开发
 

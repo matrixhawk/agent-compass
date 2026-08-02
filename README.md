@@ -2,16 +2,16 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Choose how your coding agent works. Agent Compass asks one plain-language question, installs one of four supported frameworks, verifies the result, and records the project state.
+Choose how your coding agent works. Agent Compass first checks whether the project warrants a framework, selects one of four supported options by user need, verifies the result, and records honest readiness state.
 
-## What remains in v0.5.0
+## Frameworks in v0.6.0
 
 | Need | Framework |
 |---|---|
-| You lead; AI helps when asked | Matt Pocock Skills |
-| AI proposes a plan before coding | OpenSpec |
-| AI remembers project rules over time | Trellis |
-| AI plans and completes the whole task | Superpowers |
+| On-demand debugging, review, design, and TDD | Matt Pocock Skills |
+| Reviewable specifications before implementation | OpenSpec |
+| Cross-session project context and task continuity | Trellis |
+| Strict planning, implementation, and validation for a complex task | Superpowers |
 
 Spec Kit, BMAD, Compound Engineering, and Ponytail were removed because their user value overlapped too heavily with the retained choices. Agent Compass still detects their legacy traces and refuses to install over them.
 
@@ -41,13 +41,22 @@ Replace `codex` with `claude-code`, `cursor`, or `opencode` as needed.
 Agent Compass asks:
 
 ```text
-你希望 AI 主要怎么工作？
+这个项目是否需要长期维护或严格工程流程？
 
-1. 我来主导，AI 按需帮我
-2. AI 先给方案，我确认后再做
-3. AI 长期记住这个项目的规则
-4. AI 自己规划并完成整个任务
-5. 不安装任何框架
+1. 否，只是短期、低风险或一次性任务
+2. 是，或者我还不确定
+```
+
+Short, low-risk work defaults to no framework. Otherwise it asks:
+
+```text
+你最想解决哪类问题？
+
+1. 由我主导，按需调用调试、评审和 TDD Skills
+2. 每次变更先形成可评审的规格，再开始实现
+3. 跨会话接续项目规范、任务进度和设计决策
+4. 让单次复杂任务遵循严格的规划、实现和验证流程
+5. 仍然不安装任何框架
 ```
 
 For choices 1–4 it then asks whether AI should default to the smallest necessary change.
@@ -88,11 +97,42 @@ Uses a resolved exact `@fission-ai/openspec` npm version, initializes selected h
 
 ### Trellis
 
-Uses a resolved exact `@mindfoldhq/trellis` npm version, initializes all requested hosts, and verifies both core and platform files. It does not install Trellis globally.
+Uses a resolved exact `@mindfoldhq/trellis` npm version, initializes requested hosts, and verifies core and platform files. It does not install Trellis globally.
+
+Trellis file installation is not treated as full readiness. Agent Compass records one of:
+
+- `installed`: files exist, but a readiness gate is unknown
+- `activation_pending`: host activation or Hook approval remains
+- `bootstrap_pending`: `00-bootstrap-guidelines` still needs to produce project-specific specs
+- `ready`: installation, activation, and bootstrap are complete
+
+For Codex, enable hooks and approve the Trellis Hook through `/hooks`. After completing activation and the bootstrap workflow, finalize explicitly:
+
+```bash
+python3 skills/agent-compass/scripts/compass_bootstrap.py trellis \
+  --project-root . \
+  --harness codex \
+  --finalize \
+  --confirm-trellis-activation \
+  --confirm-trellis-bootstrap \
+  --yes
+```
 
 ### Superpowers
 
 Uses the official Codex plugin when Codex is the only selected host. Other hosts default to project-local Skills. The project-local mode is explicitly marked as a compatibility fallback and does not claim official plugin hooks.
+
+## Read-only health check
+
+Diagnose the recorded setup without modifying project or host state:
+
+```bash
+python3 skills/agent-compass/scripts/compass_bootstrap.py \
+  --project-root . \
+  --doctor
+```
+
+The command returns 0 only for a recorded and verified `ready` setup. Missing state, legacy Trellis readiness, incomplete gates, or failed verification return 1.
 
 ## Safety properties
 
@@ -105,9 +145,10 @@ Uses the official Codex plugin when Codex is the only selected host. Other hosts
 - exact version or revision recording
 - post-install verification before `ready`
 - multi-host verification
-- `ready` and `pending` state distinction
+- phased Trellis readiness without false success
+- read-only health diagnosis
 
-State is stored in `.agent-compass.json` schema 5.
+State is stored in `.agent-compass.json` schema 6. Schema 5 remains readable for compatibility.
 
 ## Development
 

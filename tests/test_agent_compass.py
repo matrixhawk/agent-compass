@@ -48,8 +48,30 @@ def create_valid_trellis(root: Path) -> None:
         (root / ".trellis" / relative).write_text("ok\n", encoding="utf-8")
 
 
+def create_trellis_platform(root: Path, harness: str) -> None:
+    for relative in module.TRELLIS_PLATFORM_PATHS[harness]:
+        path = root / relative
+        if relative.suffix == "":
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("ok\n", encoding="utf-8")
+
+
 class SelectionTests(unittest.TestCase):
-    def test_questionnaire_maps_directly_to_four_frameworks(self):
+    def test_short_low_risk_project_skips_framework(self):
+        with mock.patch.object(
+            module, "prompt_choice", return_value=1
+        ) as choice_prompt, mock.patch.object(
+            module, "prompt_yes_no"
+        ) as minimal_prompt:
+            self.assertEqual(
+                module.choose_framework_interactively(), ("none", False)
+            )
+            choice_prompt.assert_called_once()
+            minimal_prompt.assert_not_called()
+
+    def test_maintained_project_maps_need_to_framework(self):
         expected = {
             1: "matt",
             2: "openspec",
@@ -59,7 +81,7 @@ class SelectionTests(unittest.TestCase):
         }
         for answer, framework in expected.items():
             with self.subTest(answer=answer), mock.patch.object(
-                module, "prompt_choice", return_value=answer
+                module, "prompt_choice", side_effect=[2, answer]
             ), mock.patch.object(
                 module, "prompt_yes_no", return_value=True
             ) as minimal_prompt:
@@ -80,6 +102,7 @@ class SelectionTests(unittest.TestCase):
                 io.StringIO()
             ), self.assertRaises(SystemExit):
                 parser.parse_args([removed])
+        self.assertTrue(parser.parse_args(["--doctor"]).doctor)
 
     def test_aliases_are_limited_to_retained_frameworks(self):
         self.assertEqual(module.canonical_framework("open-spec"), "openspec")
@@ -349,7 +372,53 @@ class VerificationAndCommandTests(unittest.TestCase):
             self.assertIn("@mindfoldhq/trellis@1.2.3", command)
             self.assertIn("--codex", command)
             self.assertIn("--cursor", command)
-            self.assertEqual(outcome.status, "ready")
+            self.assertEqual(outcome.status, "activation_pending")
+            self.assertEqual(outcome.readiness["installation"], "ready")
+            self.assertEqual(outcome.readiness["activation"], "pending")
+            self.assertEqual(outcome.readiness["bootstrap"], "pending")
+
+    def test_trellis_finalize_advances_explicit_readiness_gates(self):
+        with TempRepo() as root:
+            create_valid_trellis(root)
+            create_trellis_platform(root, "codex")
+
+            activation_pending = module.finalize_framework(
+                root,
+                "trellis",
+                ["codex"],
+                "official",
+                dry_run=False,
+                timeout=10,
+            )
+            self.assertEqual(
+                activation_pending.status, "activation_pending"
+            )
+
+            bootstrap_pending = module.finalize_framework(
+                root,
+                "trellis",
+                ["codex"],
+                "official",
+                dry_run=False,
+                timeout=10,
+                confirm_trellis_activation=True,
+            )
+            self.assertEqual(
+                bootstrap_pending.status, "bootstrap_pending"
+            )
+
+            ready = module.finalize_framework(
+                root,
+                "trellis",
+                ["codex"],
+                "official",
+                dry_run=False,
+                timeout=10,
+                confirm_trellis_activation=True,
+                confirm_trellis_bootstrap=True,
+            )
+            self.assertEqual(ready.status, "ready")
+            self.assertTrue(all(ready.verification.values()))
 
     def test_openspec_dry_run_uses_tools_and_exact_version(self):
         with TempRepo() as root, mock.patch.object(
@@ -375,6 +444,46 @@ class VerificationAndCommandTests(unittest.TestCase):
             module.find_codex_plugin(data, "superpowers", installed_only=True)
         )
 
+    def test_current_codex_plugin_list_text_is_parsed(self):
+        data = module.parse_codex_plugin_list(
+            "\n".join(
+                (
+                    "Marketplace `openai-curated`",
+                    "Path: /tmp/marketplace.json",
+                    "  github@openai-curated (installed, enabled)",
+                    "  superpowers@openai-curated (installed, disabled)",
+                    "  linear@openai-curated (not installed, disabled)",
+                )
+            )
+        )
+        superpowers = module.find_codex_plugin(
+            data, "superpowers", installed_only=True
+        )
+        self.assertIsNotNone(superpowers)
+        self.assertFalse(superpowers["enabled"])
+        self.assertEqual(
+            module.plugin_marketplace(superpowers), "openai-curated"
+        )
+        with mock.patch.object(
+            module, "codex_plugin_inventory", return_value=data
+        ), mock.patch.object(module.shutil, "which", return_value="codex"):
+            self.assertEqual(
+                module.detect_codex_plugin_frameworks(
+                    Path.cwd(), dry_run=False, timeout=10
+                ),
+                set(),
+            )
+        data["plugins"][1]["enabled"] = True
+        with mock.patch.object(
+            module, "codex_plugin_inventory", return_value=data
+        ), mock.patch.object(module.shutil, "which", return_value="codex"):
+            self.assertEqual(
+                module.detect_codex_plugin_frameworks(
+                    Path.cwd(), dry_run=False, timeout=10
+                ),
+                {"superpowers"},
+            )
+
 
 class StateAndMainTests(unittest.TestCase):
     def test_state_records_minimal_and_preserves_it(self):
@@ -393,7 +502,151 @@ class StateAndMainTests(unittest.TestCase):
         )
         self.assertTrue(second["minimal"])
         self.assertEqual(second["harnesses"], ["codex", "cursor"])
-        self.assertEqual(second["schema"], 5)
+        self.assertEqual(second["schema"], module.STATE_SCHEMA)
+
+    def test_trellis_state_records_phase_readiness(self):
+        outcome = module.InstallOutcome("trellis", "official")
+        module.set_trellis_readiness(
+            outcome, activation="pending", bootstrap="pending"
+        )
+        state = module.state_payload(
+            outcome, ["codex"], None, minimal=False
+        )
+        self.assertEqual(state["status"], "activation_pending")
+        self.assertEqual(
+            state["readiness"],
+            {
+                "installation": "ready",
+                "activation": "pending",
+                "bootstrap": "pending",
+            },
+        )
+
+    def test_doctor_is_read_only_and_reports_pending_trellis(self):
+        with TempRepo() as root:
+            create_valid_trellis(root)
+            create_trellis_platform(root, "codex")
+            outcome = module.InstallOutcome("trellis", "official")
+            module.set_trellis_readiness(
+                outcome, activation="pending", bootstrap="pending"
+            )
+            state_path = root / module.STATE_FILE
+            state_path.write_text(
+                json.dumps(
+                    module.state_payload(
+                        outcome, ["codex"], None, minimal=False
+                    )
+                ),
+                encoding="utf-8",
+            )
+            before = state_path.read_bytes()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = module.doctor_project(root, timeout=10)
+            self.assertEqual(rc, 1)
+            self.assertEqual(state_path.read_bytes(), before)
+
+    def test_doctor_reports_ready_trellis(self):
+        with TempRepo() as root:
+            create_valid_trellis(root)
+            create_trellis_platform(root, "codex")
+            outcome = module.InstallOutcome("trellis", "official")
+            module.set_trellis_readiness(
+                outcome, activation="ready", bootstrap="ready"
+            )
+            (root / module.STATE_FILE).write_text(
+                json.dumps(
+                    module.state_payload(
+                        outcome, ["codex"], None, minimal=False
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = module.doctor_project(root, timeout=10)
+            self.assertEqual(rc, 0)
+
+    def test_doctor_requires_schema_6_trellis_readiness(self):
+        with TempRepo() as root:
+            create_valid_trellis(root)
+            create_trellis_platform(root, "codex")
+            (root / module.STATE_FILE).write_text(
+                json.dumps(
+                    {
+                        "schema": 5,
+                        "framework": "trellis",
+                        "integration": "official",
+                        "harnesses": ["codex"],
+                        "status": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = module.doctor_project(root, timeout=10)
+            self.assertEqual(rc, 1)
+
+    def test_doctor_rejects_ignored_install_options(self):
+        with TempRepo() as root:
+            with self.assertRaises(module.BootstrapError):
+                module.main(
+                    [
+                        "--doctor",
+                        "--harness",
+                        "codex",
+                        "--project-root",
+                        str(root),
+                    ]
+                )
+
+    def test_trellis_confirmation_requires_finalize(self):
+        with TempRepo() as root:
+            with self.assertRaises(module.BootstrapError):
+                module.main(
+                    [
+                        "trellis",
+                        "--confirm-trellis-bootstrap",
+                        "--project-root",
+                        str(root),
+                        "--harness",
+                        "codex",
+                    ]
+                )
+
+    def test_trellis_finalize_preserves_prior_confirmation(self):
+        with TempRepo() as root:
+            create_valid_trellis(root)
+            create_trellis_platform(root, "codex")
+            outcome = module.InstallOutcome("trellis", "official")
+            module.set_trellis_readiness(
+                outcome, activation="ready", bootstrap="pending"
+            )
+            (root / module.STATE_FILE).write_text(
+                json.dumps(
+                    module.state_payload(
+                        outcome, ["codex"], None, minimal=False
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                module, "detect_codex_plugin_frameworks", return_value=set()
+            ), contextlib.redirect_stdout(io.StringIO()):
+                rc = module.main(
+                    [
+                        "--finalize",
+                        "--confirm-trellis-bootstrap",
+                        "--project-root",
+                        str(root),
+                        "--yes",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            state = json.loads(
+                (root / module.STATE_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(state["status"], "ready")
+            self.assertEqual(state["readiness"]["activation"], "ready")
+            self.assertEqual(state["readiness"]["bootstrap"], "ready")
 
     def test_main_adds_minimal_policy_after_successful_install(self):
         with TempRepo() as root, mock.patch.object(
