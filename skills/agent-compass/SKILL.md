@@ -145,6 +145,8 @@ python3 scripts/compass_bootstrap.py --doctor --project-root <repo-root>
 
 Do not combine `--doctor` with install, repair, minimal, finalize, confirmation, harness, integration, yes, or dry-run options. Allow `--language auto|zh|en` because it changes output only. Do not write state or repair files. Return 0 only when state is structurally valid, exactly one framework is present, managed artifacts and checksums match, host identity checks pass, and the recorded status is `ready`. Return 1 for missing state, a repository lock, pending gates, legacy readiness, conflicts, tampering, or failed checks.
 
+Report failures in the requested language, including the embedded cause, and keep the failing command's own output tail in the message. When the Codex plugin inventory cannot be read, report that a plugin-installed framework cannot be ruled out and give the reason; never downgrade that to a clean result.
+
 ## Minimal policy
 
 `--minimal` writes an independent managed rule to the appropriate instruction file:

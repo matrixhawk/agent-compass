@@ -179,7 +179,18 @@ OPENSPEC_SKILL_ROOT = {
 }
 
 class BootstrapError(RuntimeError):
-    """Expected user-actionable bootstrap failure."""
+    """Expected user-actionable bootstrap failure.
+
+    Messages are authored in Chinese. Pass ``en`` to supply an English
+    variant for interpolated messages; static messages are translated at the
+    display boundary through ``ERROR_MESSAGE_ENGLISH``. ``str()`` keeps
+    returning the Chinese text so existing callers and logs are unchanged.
+    """
+
+    def __init__(self, zh: str, en: str | None = None) -> None:
+        super().__init__(zh)
+        self.zh = zh
+        self.en = en
 
 
 @dataclass(frozen=True)
@@ -363,11 +374,17 @@ def ensure_safe_path(root: Path, path: Path, *, for_write: bool) -> None:
     try:
         relative = absolute.relative_to(root)
     except ValueError as exc:
-        raise BootstrapError(f"目标不在项目目录内：{path}") from exc
+        raise BootstrapError(
+            f"目标不在项目目录内：{path}",
+            f"Target is outside the project directory: {path}",
+        ) from exc
 
     if absolute == root:
         if for_write and (not root.exists() or not root.is_dir()):
-            raise BootstrapError(f"项目根目录不可写入：{root}")
+            raise BootstrapError(
+                f"项目根目录不可写入：{root}",
+                f"Project root is not writable: {root}",
+            )
         return
 
     current = root
@@ -377,7 +394,10 @@ def ensure_safe_path(root: Path, path: Path, *, for_write: bool) -> None:
             continue
         st = current.lstat()
         if stat.S_ISLNK(st.st_mode):
-            raise BootstrapError(f"拒绝访问符号链接路径：{current}")
+            raise BootstrapError(
+                f"拒绝访问符号链接路径：{current}",
+                f"Refusing to access a symbolic-link path: {current}",
+            )
 
     parent = absolute.parent
     # resolve(strict=False) follows existing parents; all existing components were
@@ -385,25 +405,40 @@ def ensure_safe_path(root: Path, path: Path, *, for_write: bool) -> None:
     resolved_root = root.resolve(strict=False)
     resolved_parent = parent.resolve(strict=False)
     if resolved_parent != resolved_root and resolved_root not in resolved_parent.parents:
-        raise BootstrapError(f"目标父目录逃逸项目范围：{path}")
+        raise BootstrapError(
+            f"目标父目录逃逸项目范围：{path}",
+            f"Target parent directory escapes the project scope: {path}",
+        )
 
     if for_write and lstat_exists(absolute):
         st = absolute.lstat()
         if not stat.S_ISREG(st.st_mode) and not stat.S_ISDIR(st.st_mode):
-            raise BootstrapError(f"拒绝覆盖特殊文件：{path}")
+            raise BootstrapError(
+                f"拒绝覆盖特殊文件：{path}",
+                f"Refusing to overwrite a special file: {path}",
+            )
 
 
 def safe_read_text(root: Path, path: Path) -> str:
     ensure_safe_path(root, path, for_write=False)
     if not lstat_exists(path):
-        raise BootstrapError(f"文件不存在：{path}")
+        raise BootstrapError(
+            f"文件不存在：{path}",
+            f"File does not exist: {path}",
+        )
     st = path.lstat()
     if not stat.S_ISREG(st.st_mode):
-        raise BootstrapError(f"拒绝读取非普通文件：{path}")
+        raise BootstrapError(
+            f"拒绝读取非普通文件：{path}",
+            f"Refusing to read a non-regular file: {path}",
+        )
     try:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
-        raise BootstrapError(f"文件不是有效 UTF-8：{path}") from exc
+        raise BootstrapError(
+            f"文件不是有效 UTF-8：{path}",
+            f"File is not valid UTF-8: {path}",
+        ) from exc
 
 
 def reject_symlinks_in_tree(root: Path, base: Path) -> None:
@@ -414,29 +449,44 @@ def reject_symlinks_in_tree(root: Path, base: Path) -> None:
     if base.is_file():
         return
     if not base.is_dir():
-        raise BootstrapError(f"安装目标不是普通文件或目录：{base}")
+        raise BootstrapError(
+            f"安装目标不是普通文件或目录：{base}",
+            f"Install target is not a regular file or directory: {base}",
+        )
     for path in base.rglob("*"):
         ensure_safe_path(root, path, for_write=False)
         if path.is_symlink():
-            raise BootstrapError(f"安装目标包含符号链接：{path}")
+            raise BootstrapError(
+                f"安装目标包含符号链接：{path}",
+                f"Install target contains a symbolic link: {path}",
+            )
 
 
 def hash_file(root: Path, path: Path) -> str:
     ensure_safe_path(root, path, for_write=False)
     if not path.is_file() or path.is_symlink():
-        raise BootstrapError(f"无法校验非普通文件：{path}")
+        raise BootstrapError(
+            f"无法校验非普通文件：{path}",
+            f"Cannot checksum a non-regular file: {path}",
+        )
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def hash_directory(root: Path, directory: Path) -> str:
     ensure_safe_path(root, directory, for_write=False)
     if not directory.is_dir() or directory.is_symlink():
-        raise BootstrapError(f"无法校验非普通目录：{directory}")
+        raise BootstrapError(
+            f"无法校验非普通目录：{directory}",
+            f"Cannot checksum a non-regular directory: {directory}",
+        )
     digest = hashlib.sha256()
     for path in sorted(directory.rglob("*")):
         ensure_safe_path(root, path, for_write=False)
         if path.is_symlink():
-            raise BootstrapError(f"校验目录包含符号链接：{path}")
+            raise BootstrapError(
+                f"校验目录包含符号链接：{path}",
+                f"Checksum directory contains a symbolic link: {path}",
+            )
         relative = path.relative_to(directory).as_posix().encode("utf-8")
         if path.is_dir():
             digest.update(b"D\0" + relative + b"\0")
@@ -445,7 +495,10 @@ def hash_directory(root: Path, directory: Path) -> str:
             digest.update(path.read_bytes())
             digest.update(b"\0")
         else:
-            raise BootstrapError(f"校验目录包含特殊文件：{path}")
+            raise BootstrapError(
+                f"校验目录包含特殊文件：{path}",
+                f"Checksum directory contains a special file: {path}",
+            )
     return digest.hexdigest()
 
 
@@ -597,6 +650,197 @@ def localized_outcome_message(message: str, language: str) -> str:
     return message
 
 
+ERROR_MESSAGE_ENGLISH = {
+    "无法自动识别 Agent，请传入 --harness codex|claude-code|cursor|opencode。": (
+        "Could not detect the Agent automatically; pass "
+        "--harness codex|claude-code|cursor|opencode."
+    ),
+    "--harness auto 不能和其他 Agent 同时使用。": (
+        "--harness auto cannot be combined with other Agents."
+    ),
+    "状态文件中的 framework 无效。": "Invalid framework in the state file.",
+    "状态文件没有有效的 harnesses。": (
+        "The state file has no valid harnesses."
+    ),
+    "状态文件 harnesses 必须全部是字符串。": (
+        "State file harnesses must all be strings."
+    ),
+    "状态文件 readiness 必须是对象。": (
+        "State file readiness must be an object."
+    ),
+    "状态文件 host_readiness 必须是对象。": (
+        "State file host_readiness must be an object."
+    ),
+    "Trellis host_readiness 与 harnesses 不一致。": (
+        "Trellis host_readiness is inconsistent with harnesses."
+    ),
+    "Superpowers host_readiness 与 harnesses 不一致。": (
+        "Superpowers host_readiness is inconsistent with harnesses."
+    ),
+    "Matt status 无效。": "Invalid Matt status.",
+    "状态文件 minimal 必须是布尔值。": (
+        "State file minimal must be a boolean."
+    ),
+    "状态文件 verification 必须是布尔映射。": (
+        "State file verification must be a mapping of booleans."
+    ),
+    ".trellis 存在但不是目录。": ".trellis exists but is not a directory.",
+    (
+        "检测到不完整的 .trellis 目录。为避免把半成品误判为成功，请先备份并清理，"
+        "或确认后使用 --repair 让官方 CLI 尝试修复。"
+    ): (
+        "Detected an incomplete .trellis directory. To avoid treating a "
+        "partial install as success, back it up and clean it first, or "
+        "confirm and use --repair to let the official CLI attempt a repair."
+    ),
+    "openspec 存在但不是安全目录。": (
+        "openspec exists but is not a safe directory."
+    ),
+    "opencode.json 不是有效 JSON，无法完成遗留框架检测。": (
+        "opencode.json is not valid JSON, so legacy framework detection "
+        "cannot complete."
+    ),
+    "skills 安装后未生成 skills-lock.json。": (
+        "skills-lock.json was not generated after the skills install."
+    ),
+    "skills 安装后生成了无效锁文件。": (
+        "The skills install produced an invalid lock file."
+    ),
+    "skills-lock.json 格式与 skills@1.5.9 不兼容。": (
+        f"skills-lock.json format is incompatible with "
+        f"skills@{SKILLS_CLI_VERSION}."
+    ),
+    "skills-lock.json 精确来源写入后验证失败。": (
+        "Verification failed after writing the exact source into "
+        "skills-lock.json."
+    ),
+    "skills-lock.json 中同一框架的提交不一致。": (
+        "skills-lock.json records inconsistent commits for the same "
+        "framework."
+    ),
+    "skills-lock.json 不是普通文件。": (
+        "skills-lock.json is not a regular file."
+    ),
+    ".trellis 不完整；请备份后使用 --repair，或清理后重新初始化。": (
+        ".trellis is incomplete; back it up and use --repair, or clean it "
+        "and initialize again."
+    ),
+    "无法确定 Trellis 开发者名称，请传入 --user。": (
+        "Could not determine the Trellis developer name; pass --user."
+    ),
+    "Trellis 开发者名称不能为空。": (
+        "The Trellis developer name cannot be empty."
+    ),
+    "Codex 插件清单格式无法识别。": (
+        "Unrecognized Codex plugin inventory format."
+    ),
+    "无法读取 Codex 插件冲突：缺少 codex 命令。": (
+        "Cannot read Codex plugin conflicts: the codex command is missing."
+    ),
+    "Codex 官方 Marketplace 中未找到 Superpowers 插件。": (
+        "The Superpowers plugin was not found in the official Codex "
+        "Marketplace."
+    ),
+    "无法确定 Superpowers 插件所属 Marketplace。": (
+        "Could not determine which Marketplace provides the Superpowers "
+        "plugin."
+    ),
+    "Codex Superpowers 插件安装后未处于已安装/启用状态。": (
+        "The Codex Superpowers plugin is not installed/enabled after "
+        "installation."
+    ),
+    "无法记录 Codex Superpowers 插件身份。": (
+        "Could not record the Codex Superpowers plugin identity."
+    ),
+    "Trellis 核心文件不完整。": "Trellis core files are incomplete.",
+    "Superpowers project-skills 托管指令缺失或已变化。": (
+        "The Superpowers project-skills managed instructions are missing or "
+        "changed."
+    ),
+    "尚未检测到已安装并启用的 Codex Superpowers 插件。": (
+        "No installed and enabled Codex Superpowers plugin was detected."
+    ),
+    "状态文件写入后验证失败。": (
+        "Verification failed after writing the state file."
+    ),
+    "`none` 不能与安装、finalize 或配置参数组合。": (
+        "`none` cannot be combined with install, finalize, or configuration "
+        "options."
+    ),
+    "Trellis 确认参数只能用于 trellis --finalize。": (
+        "Trellis confirmation options are only valid with "
+        "trellis --finalize."
+    ),
+    "Superpowers 人工确认只适用于 official superpowers --finalize。": (
+        "Superpowers manual confirmation only applies to official "
+        "superpowers --finalize."
+    ),
+    "--repair 只适用于 Trellis 初始安装/修复。": (
+        "--repair only applies to the initial Trellis install/repair."
+    ),
+    "--user/--trellis-version 只适用于 Trellis 安装。": (
+        "--user/--trellis-version only apply to a Trellis install."
+    ),
+    "--openspec-version 只适用于 OpenSpec 安装。": (
+        "--openspec-version only applies to an OpenSpec install."
+    ),
+    "--confirm-trellis-activation 只在已记录 Codex 宿主时有效。": (
+        "--confirm-trellis-activation is only valid when a Codex host is "
+        "recorded."
+    ),
+    "--confirm-superpowers-installation 只用于非 Codex 官方宿主。": (
+        "--confirm-superpowers-installation only applies to non-Codex "
+        "official hosts."
+    ),
+    "--timeout 必须大于 0。": "--timeout must be greater than 0.",
+    "--doctor 不接受框架参数；它只读取已记录状态。": (
+        "--doctor does not accept a framework argument; it only reads "
+        "recorded state."
+    ),
+    "--doctor 只接受 --project-root、--timeout 和 --language。": (
+        "--doctor only accepts --project-root, --timeout, and --language."
+    ),
+    "--finalize 需要显式框架，或一个有效的 Agent Compass 状态文件。": (
+        "--finalize requires an explicit framework or a valid Agent Compass "
+        "state file."
+    ),
+    "Matt 在本选择器中使用可编辑、可验证的 project-skills 模式。": (
+        "Matt uses the editable, verifiable project-skills mode in this "
+        "selector."
+    ),
+    (
+        "Agent Compass 状态在确认期间已变化；"
+        "为避免基于过期状态覆盖，请重新运行。"
+    ): (
+        "Agent Compass state changed during confirmation; re-run to avoid "
+        "overwriting based on stale state."
+    ),
+}
+
+
+def bootstrap_error_text(exc: BootstrapError, language: str) -> str:
+    """Render a BootstrapError in the requested language.
+
+    Prefers an explicit English variant, falls back to the static
+    translation table, and finally to the original Chinese text.
+    """
+    message = str(exc)
+    if detect_prompt_language(language) == "zh":
+        return message
+    explicit = getattr(exc, "en", None)
+    if explicit:
+        return explicit
+    return ERROR_MESSAGE_ENGLISH.get(message, message)
+
+
+def doctor_failure(exc: BootstrapError, language: str) -> str:
+    return localized_text(
+        language,
+        f"诊断失败：{bootstrap_error_text(exc, 'zh')}",
+        f"Doctor failed: {bootstrap_error_text(exc, 'en')}",
+    )
+
+
 def prompt_yes_no(
     question: str, *, default: bool = False, language: str = "zh"
 ) -> bool:
@@ -705,7 +949,10 @@ def trellis_status_from_readiness(readiness: Mapping[str, str]) -> str:
         if value not in READINESS_VALUES
     }
     if invalid:
-        raise BootstrapError("非法 Trellis readiness：" + ", ".join(sorted(invalid)))
+        raise BootstrapError(
+            "非法 Trellis readiness：" + ", ".join(sorted(invalid)),
+            "Invalid Trellis readiness: " + ", ".join(sorted(invalid)),
+        )
     installation = normalized["installation"]
     activation = normalized["activation"]
     bootstrap = normalized["bootstrap"]
@@ -728,14 +975,22 @@ def set_trellis_readiness(
 ) -> None:
     """Set Trellis readiness without collapsing unverifiable user actions."""
     if bootstrap not in READINESS_VALUES:
-        raise BootstrapError(f"非法 Trellis bootstrap readiness：{bootstrap}")
+        raise BootstrapError(
+            f"非法 Trellis bootstrap readiness：{bootstrap}",
+            f"Invalid Trellis bootstrap readiness: {bootstrap}",
+        )
     normalized_hosts: dict[str, dict[str, str]] = {}
     for harness, activation in host_activation.items():
         if harness not in ACTIVE_HARNESSES:
-            raise BootstrapError(f"非法 Trellis host readiness：{harness}")
+            raise BootstrapError(
+                f"非法 Trellis host readiness：{harness}",
+                f"Invalid Trellis host readiness: {harness}",
+            )
         if activation not in READINESS_VALUES:
             raise BootstrapError(
-                f"非法 Trellis activation readiness：{harness}={activation}"
+                f"非法 Trellis activation readiness：{harness}={activation}",
+                f"Invalid Trellis activation readiness: "
+                f"{harness}={activation}",
             )
         normalized_hosts[harness] = {
             "installation": "ready",
@@ -831,10 +1086,35 @@ def normalize_harnesses(
 def require_executable(name: str) -> str:
     path = shutil.which(name)
     if not path:
-        raise BootstrapError(f"缺少必需命令：{name}")
+        raise BootstrapError(
+            f"缺少必需命令：{name}",
+            f"Missing required command: {name}",
+        )
     return path
 
 
+
+
+COMMAND_DETAIL_MAX_LINES = 5
+COMMAND_DETAIL_MAX_CHARS = 800
+
+
+def command_failure_detail(stdout: str, stderr: str) -> str:
+    """Return a trimmed tail of a failed command's output.
+
+    Errors usually land on stderr, but some CLIs report them on stdout, so
+    fall back to stdout when stderr is empty. The result is capped so a
+    verbose command cannot flood the error message.
+    """
+    source = stderr.strip() or stdout.strip()
+    if not source:
+        return ""
+    lines = source.splitlines()
+    tail = lines[-COMMAND_DETAIL_MAX_LINES:]
+    detail = "\n".join(line.rstrip() for line in tail).strip()
+    if len(detail) > COMMAND_DETAIL_MAX_CHARS:
+        detail = detail[-COMMAND_DETAIL_MAX_CHARS:].lstrip()
+    return detail
 
 
 def run(
@@ -866,16 +1146,31 @@ def run(
             env=merged_env,
         )
     except subprocess.TimeoutExpired as exc:
-        raise BootstrapError(f"命令超时（{timeout}s）：{printable}") from exc
+        raise BootstrapError(
+            f"命令超时（{timeout}s）：{printable}",
+            f"Command timed out after {timeout}s: {printable}",
+        ) from exc
     except OSError as exc:
-        raise BootstrapError(f"无法执行命令：{printable}：{exc}") from exc
+        raise BootstrapError(
+            f"无法执行命令：{printable}：{exc}",
+            f"Could not execute command: {printable}: {exc}",
+        ) from exc
 
     if completed.stdout and echo_output:
         print(completed.stdout, end="")
     if completed.stderr and echo_output:
         print(completed.stderr, end="", file=sys.stderr)
     if completed.returncode != 0:
-        raise BootstrapError(f"命令失败（退出码 {completed.returncode}）：{printable}")
+        # Surface the failing command's own output. Callers that suppress
+        # echo (echo_output=False) would otherwise discard the only
+        # actionable cause, leaving just an exit code.
+        detail = command_failure_detail(completed.stdout, completed.stderr)
+        raise BootstrapError(
+            f"命令失败（退出码 {completed.returncode}）：{printable}"
+            + (f"\n命令输出：\n{detail}" if detail else ""),
+            f"Command failed (exit code {completed.returncode}): {printable}"
+            + (f"\nCommand output:\n{detail}" if detail else ""),
+        )
     return CommandResult(
         tuple(str(item) for item in command),
         completed.returncode,
@@ -898,7 +1193,10 @@ def run_json(
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise BootstrapError(f"命令未返回有效 JSON：{shlex.join(command)}") from exc
+        raise BootstrapError(
+            f"命令未返回有效 JSON：{shlex.join(command)}",
+            f"Command did not return valid JSON: {shlex.join(command)}",
+        ) from exc
 
 
 def parse_node_version(raw: str) -> tuple[int, int] | None:
@@ -1008,10 +1306,15 @@ def load_state(root: Path) -> dict[str, Any] | None:
         state = json.loads(text)
     except json.JSONDecodeError as exc:
         raise BootstrapError(
-            f"{STATE_FILE} 已损坏，拒绝继续覆盖；请修复或移走该文件后重试。"
+            f"{STATE_FILE} 已损坏，拒绝继续覆盖；请修复或移走该文件后重试。",
+            f"{STATE_FILE} is corrupt; refusing to overwrite it. Repair or "
+            "move the file, then retry.",
         ) from exc
     if not isinstance(state, dict):
-        raise BootstrapError(f"{STATE_FILE} 顶层必须是 JSON 对象。")
+        raise BootstrapError(
+            f"{STATE_FILE} 顶层必须是 JSON 对象。",
+            f"The top level of {STATE_FILE} must be a JSON object.",
+        )
     return state
 
 
@@ -1020,10 +1323,15 @@ def validate_recorded_state(
 ) -> tuple[str, str, list[str]]:
     schema = state.get("schema")
     if not isinstance(schema, int) or schema not in READABLE_STATE_SCHEMAS:
-        raise BootstrapError(f"状态文件 schema 不受支持：{schema!r}")
+        raise BootstrapError(
+            f"状态文件 schema 不受支持：{schema!r}",
+            f"Unsupported state file schema: {schema!r}",
+        )
     if require_current_schema and schema != STATE_SCHEMA:
         raise BootstrapError(
-            f"状态文件 schema {schema} 需要重新 finalize 为 schema {STATE_SCHEMA}。"
+            f"状态文件 schema {schema} 需要重新 finalize 为 schema {STATE_SCHEMA}。",
+            f"State file schema {schema} must be finalized again into "
+            f"schema {STATE_SCHEMA}.",
         )
 
     framework = canonical_framework(str(state.get("framework") or ""))
@@ -1038,7 +1346,9 @@ def validate_recorded_state(
         raise BootstrapError("状态文件中的 framework 无效。")
     if integration not in valid_integrations[framework]:
         raise BootstrapError(
-            f"状态文件中的集成组合无效：{framework}/{integration}。"
+            f"状态文件中的集成组合无效：{framework}/{integration}。",
+            f"Invalid integration combination in the state file: "
+            f"{framework}/{integration}.",
         )
 
     raw_harnesses = state.get("harnesses")
@@ -1049,12 +1359,19 @@ def validate_recorded_state(
     harnesses = list(dict.fromkeys(raw_harnesses))
     invalid = sorted(set(harnesses) - set(ACTIVE_HARNESSES))
     if invalid or len(harnesses) != len(raw_harnesses):
-        detail = ", ".join(invalid) if invalid else "存在重复项"
-        raise BootstrapError("状态文件包含无效 harnesses：" + detail)
+        raise BootstrapError(
+            "状态文件包含无效 harnesses："
+            + (", ".join(invalid) if invalid else "存在重复项"),
+            "The state file contains invalid harnesses: "
+            + (", ".join(invalid) if invalid else "duplicate entries"),
+        )
 
     status = str(state.get("status") or "")
     if status not in STATE_STATUSES:
-        raise BootstrapError(f"状态文件中的 status 无效：{status!r}")
+        raise BootstrapError(
+            f"状态文件中的 status 无效：{status!r}",
+            f"Invalid status in the state file: {status!r}",
+        )
 
     if schema == STATE_SCHEMA:
         readiness = state.get("readiness", {})
@@ -1062,17 +1379,25 @@ def validate_recorded_state(
             raise BootstrapError("状态文件 readiness 必须是对象。")
         for key, value in readiness.items():
             if not isinstance(key, str) or str(value) not in READINESS_VALUES:
-                raise BootstrapError(f"状态文件 readiness 无效：{key}={value}")
+                raise BootstrapError(
+                    f"状态文件 readiness 无效：{key}={value}",
+                    f"Invalid state file readiness: {key}={value}",
+                )
         host_readiness = state.get("host_readiness", {})
         if not isinstance(host_readiness, Mapping):
             raise BootstrapError("状态文件 host_readiness 必须是对象。")
         for host, values in host_readiness.items():
             if host not in ACTIVE_HARNESSES or not isinstance(values, Mapping):
-                raise BootstrapError(f"状态文件 host_readiness 无效：{host}")
+                raise BootstrapError(
+                    f"状态文件 host_readiness 无效：{host}",
+                    f"Invalid state file host_readiness: {host}",
+                )
             for key, value in values.items():
                 if not isinstance(key, str) or str(value) not in READINESS_VALUES:
                     raise BootstrapError(
-                        f"状态文件 host_readiness 无效：{host}.{key}={value}"
+                        f"状态文件 host_readiness 无效：{host}.{key}={value}",
+                        f"Invalid state file host_readiness: "
+                        f"{host}.{key}={value}",
                     )
         if framework == "trellis" and set(host_readiness) != set(harnesses):
             raise BootstrapError("Trellis host_readiness 与 harnesses 不一致。")
@@ -1092,12 +1417,15 @@ def validate_recorded_state(
             )
             if set(readiness) != expected_readiness_keys:
                 raise BootstrapError(
-                    f"{framework} readiness 字段不完整。"
+                    f"{framework} readiness 字段不完整。",
+                    f"{framework} readiness fields are incomplete.",
                 )
             for host, values in host_readiness.items():
                 if set(values) != {"installation", "activation"}:
                     raise BootstrapError(
-                        f"{framework} host_readiness 字段不完整：{host}"
+                        f"{framework} host_readiness 字段不完整：{host}",
+                        f"{framework} host_readiness fields are incomplete: "
+                        f"{host}",
                     )
             expected_installation = aggregate_host_readiness(
                 host_readiness, "installation"
@@ -1110,7 +1438,9 @@ def validate_recorded_state(
                 or readiness.get("activation") != expected_activation
             ):
                 raise BootstrapError(
-                    f"{framework} 总体 readiness 与逐宿主状态不一致。"
+                    f"{framework} 总体 readiness 与逐宿主状态不一致。",
+                    f"{framework} aggregate readiness is inconsistent with "
+                    "the per-host state.",
                 )
             expected_status = (
                 trellis_status_from_readiness(readiness)
@@ -1124,18 +1454,24 @@ def validate_recorded_state(
             )
             if status != expected_status:
                 raise BootstrapError(
-                    f"{framework} status 与 readiness 不一致。"
+                    f"{framework} status 与 readiness 不一致。",
+                    f"{framework} status is inconsistent with readiness.",
                 )
         elif readiness or host_readiness:
             raise BootstrapError(
-                f"{framework}/{integration} 不应包含分阶段 readiness。"
+                f"{framework}/{integration} 不应包含分阶段 readiness。",
+                f"{framework}/{integration} must not contain phased "
+                "readiness.",
             )
 
         if (
             framework == "openspec"
             or framework == "superpowers" and integration == "project-skills"
         ) and status != "ready":
-            raise BootstrapError(f"{framework}/{integration} status 无效。")
+            raise BootstrapError(
+                f"{framework}/{integration} status 无效。",
+                f"Invalid {framework}/{integration} status.",
+            )
         if framework == "matt" and status not in {"pending", "ready"}:
             raise BootstrapError("Matt status 无效。")
         if not isinstance(state.get("minimal"), bool):
@@ -1146,7 +1482,10 @@ def validate_recorded_state(
                 not isinstance(item_key, str) or not isinstance(item_value, str)
                 for item_key, item_value in value.items()
             ):
-                raise BootstrapError(f"状态文件 {key} 必须是字符串映射。")
+                raise BootstrapError(
+                    f"状态文件 {key} 必须是字符串映射。",
+                    f"State file {key} must be a mapping of strings.",
+                )
         verification = state.get("verification", {})
         if not isinstance(verification, Mapping) or any(
             not isinstance(item_key, str) or not isinstance(item_value, bool)
@@ -1163,7 +1502,10 @@ def validate_recorded_state(
             if not isinstance(value, list) or any(
                 not isinstance(item, str) for item in value
             ):
-                raise BootstrapError(f"状态文件 {key} 必须是字符串列表。")
+                raise BootstrapError(
+                    f"状态文件 {key} 必须是字符串列表。",
+                    f"State file {key} must be a list of strings.",
+                )
 
     return framework, integration, harnesses
 
@@ -1204,7 +1546,10 @@ def detect_frameworks_from_lock(root: Path) -> set[str]:
         try:
             data = json.loads(safe_read_text(root, path))
         except json.JSONDecodeError as exc:
-            raise BootstrapError(f"技能锁文件损坏：{relative}") from exc
+            raise BootstrapError(
+                f"技能锁文件损坏：{relative}",
+                f"Corrupt skills lock file: {relative}",
+            ) from exc
         joined = "\n".join(flatten_json_strings(data)).lower()
         for framework, source in SOURCE_REPOSITORIES.items():
             if source.lower() in joined:
@@ -1247,7 +1592,11 @@ def detect_project_skill_frameworks(root: Path) -> set[str]:
             continue
         ensure_safe_path(root, base, for_write=False)
         if not base.is_dir() or base.is_symlink():
-            raise BootstrapError(f"Skill 根路径不是安全目录：{base.relative_to(root)}")
+            raise BootstrapError(
+                f"Skill 根路径不是安全目录：{base.relative_to(root)}",
+                f"Skill root is not a safe directory: "
+                f"{base.relative_to(root)}",
+            )
         for framework, skills in EXPECTED_SKILLS.items():
             complete = True
             for skill in skills:
@@ -1308,7 +1657,11 @@ def detect_existing_frameworks(root: Path, *, repair: bool = False) -> set[str]:
             continue
         ensure_safe_path(root, path, for_write=False)
         if path.is_symlink():
-            raise BootstrapError(f"{path.relative_to(root)} 是符号链接，拒绝继续。")
+            raise BootstrapError(
+                f"{path.relative_to(root)} 是符号链接，拒绝继续。",
+                f"{path.relative_to(root)} is a symbolic link; refusing to "
+                "continue.",
+            )
         found.add(framework)
 
     opencode = root / "opencode.json"
@@ -1340,7 +1693,11 @@ def instruction_files(root: Path, harnesses: Sequence[str]) -> list[Path]:
 
 def managed_block(framework: str, integration: str) -> str:
     if framework != "superpowers":
-        raise BootstrapError(f"无需写入框架托管指令：{framework}")
+        raise BootstrapError(
+            f"无需写入框架托管指令：{framework}",
+            f"No managed framework instruction needs to be written: "
+            f"{framework}",
+        )
     body = (
         "## Superpowers project-skills integration\n\n"
         "This repository uses the project-local Superpowers skills integration, not the full "
@@ -1590,7 +1947,10 @@ def rewrite_project_skills_lock(
     for skill in EXPECTED_SKILLS[framework]:
         entry = data["skills"].get(skill)
         if not isinstance(entry, dict):
-            raise BootstrapError(f"skills-lock.json 缺少条目：{skill}")
+            raise BootstrapError(
+                f"skills-lock.json 缺少条目：{skill}",
+                f"skills-lock.json is missing an entry: {skill}",
+            )
         entry["source"] = source
         entry["sourceType"] = "github"
         entry["ref"] = revision
@@ -1620,7 +1980,10 @@ def verify_project_skills_lock_provenance(
     for skill in EXPECTED_SKILLS[framework]:
         entry = data["skills"].get(skill)
         if not isinstance(entry, dict):
-            raise BootstrapError(f"skills-lock.json 缺少条目：{skill}")
+            raise BootstrapError(
+                f"skills-lock.json 缺少条目：{skill}",
+                f"skills-lock.json is missing an entry: {skill}",
+            )
         revision = str(entry.get("ref") or "").lower()
         if (
             entry.get("source") != source
@@ -1628,7 +1991,8 @@ def verify_project_skills_lock_provenance(
             or not re.fullmatch(r"[0-9a-f]{40}", revision)
         ):
             raise BootstrapError(
-                f"skills-lock.json 来源未精确固定：{skill}"
+                f"skills-lock.json 来源未精确固定：{skill}",
+                f"skills-lock.json source is not pinned exactly: {skill}",
             )
         revisions.add(revision)
     if len(revisions) != 1:
@@ -1705,7 +2069,11 @@ def verify_project_skills(
             ok = path is not None
             verification[key] = ok
             if not ok:
-                raise BootstrapError(f"安装后未找到预期 Skill：{root_label}/{skill}")
+                raise BootstrapError(
+                    f"安装后未找到预期 Skill：{root_label}/{skill}",
+                    f"Expected Skill not found after installation: "
+                    f"{root_label}/{skill}",
+                )
             assert path is not None
             created.append(str(path.parent.relative_to(root)) + "/")
             checksums[f"{root_label}/{skill}"] = hash_skill_directory(root, path)
@@ -1861,7 +2229,9 @@ def matt_setup_checksums(
         section = agent_skills_section(root, path)
         if section is None:
             raise BootstrapError(
-                f"{path.relative_to(root)} 缺少实质 Agent skills 指令。"
+                f"{path.relative_to(root)} 缺少实质 Agent skills 指令。",
+                f"{path.relative_to(root)} lacks substantive Agent skills "
+                "instructions.",
             )
         key = f"setup:instruction:{path.relative_to(root)}:Agent skills"
         checksums[key] = hashlib.sha256(
@@ -2052,10 +2422,16 @@ def verify_openspec_skills(
             continue
         if not lstat_exists(base):
             verification[key] = False
-            raise BootstrapError(f"OpenSpec {harness} Skill 根目录不存在。")
+            raise BootstrapError(
+                f"OpenSpec {harness} Skill 根目录不存在。",
+                f"The OpenSpec {harness} Skill root directory does not exist.",
+            )
         ensure_safe_path(root, base, for_write=False)
         if not base.is_dir() or base.is_symlink():
-            raise BootstrapError(f"OpenSpec {harness} Skill 根目录不安全。")
+            raise BootstrapError(
+                f"OpenSpec {harness} Skill 根目录不安全。",
+                f"The OpenSpec {harness} Skill root directory is not safe.",
+            )
         reject_symlinks_in_tree(root, base)
         skill_files: list[Path] = []
         for child in sorted(base.iterdir()):
@@ -2071,13 +2447,17 @@ def verify_openspec_skills(
                 ):
                     raise BootstrapError(
                         f"OpenSpec {harness} Skill 文档无效或为占位内容："
-                        f"{skill_file.relative_to(root)}"
+                        f"{skill_file.relative_to(root)}",
+                        f"The OpenSpec {harness} Skill document is invalid or "
+                        f"placeholder content: {skill_file.relative_to(root)}",
                     )
                 skill_files.append(skill_file)
         verification[key] = bool(skill_files)
         if not skill_files:
             raise BootstrapError(
-                f"OpenSpec {harness} 未生成有效的 openspec-*/SKILL.md。"
+                f"OpenSpec {harness} 未生成有效的 openspec-*/SKILL.md。",
+                f"OpenSpec {harness} did not generate a valid "
+                "openspec-*/SKILL.md.",
             )
         for skill_file in skill_files:
             relative = skill_file.parent.relative_to(root).as_posix()
@@ -2412,7 +2792,10 @@ def pending_official_install(
     framework: str, harnesses: Sequence[str]
 ) -> InstallOutcome:
     if framework != "superpowers":
-        raise BootstrapError(f"不支持的待人工官方安装：{framework}")
+        raise BootstrapError(
+            f"不支持的待人工官方安装：{framework}",
+            f"Unsupported pending manual official installation: {framework}",
+        )
     outcome = InstallOutcome(
         framework=framework, integration="official", status="pending"
     )
@@ -2614,7 +2997,9 @@ def finalize_framework(
         missing = [name for name, ok in setup.items() if not ok]
         if missing:
             raise BootstrapError(
-                "Matt 初始化尚未完成，缺少：" + ", ".join(missing)
+                "Matt 初始化尚未完成，缺少：" + ", ".join(missing),
+                "Matt initialization is not complete; missing: "
+                + ", ".join(missing),
             )
         if not dry_run:
             outcome.checksums.update(
@@ -2652,7 +3037,9 @@ def finalize_framework(
                 outcome.verification[str(relative)] = ok
                 if not ok:
                     raise BootstrapError(
-                        f"Trellis 平台配置缺失或类型错误：{relative}"
+                        f"Trellis 平台配置缺失或类型错误：{relative}",
+                        f"Trellis platform configuration is missing or has "
+                        f"the wrong type: {relative}",
                     )
                 outcome.checksums[str(relative)] = hash_verified_path(
                     root, path, expect_directory=expect_directory
@@ -2694,7 +3081,10 @@ def finalize_framework(
             )
             outcome.verification[str(relative) + "/"] = ok
             if not ok:
-                raise BootstrapError(f"OpenSpec 核心目录缺失：{relative}")
+                raise BootstrapError(
+                    f"OpenSpec 核心目录缺失：{relative}",
+                    f"Missing OpenSpec core directory: {relative}",
+                )
         verification, checksums, created = verify_openspec_skills(
             root, harnesses, dry_run=dry_run
         )
@@ -2704,7 +3094,10 @@ def finalize_framework(
         return outcome
 
     if framework != "superpowers":
-        raise BootstrapError(f"不支持 finalize：{framework}")
+        raise BootstrapError(
+            f"不支持 finalize：{framework}",
+            f"Finalize is not supported for: {framework}",
+        )
 
     if integration == "project-skills":
         verification, checksums, created = verify_project_skills(
@@ -2791,7 +3184,10 @@ def finalize_framework(
 def merge_readiness_value(previous: str, current: str) -> str:
     for value in (previous, current):
         if value not in READINESS_VALUES:
-            raise BootstrapError(f"非法 readiness 值：{value}")
+            raise BootstrapError(
+                f"非法 readiness 值：{value}",
+                f"Invalid readiness value: {value}",
+            )
     order = {"unknown": 0, "pending": 1, "ready": 2}
     return previous if order[previous] >= order[current] else current
 
@@ -2801,7 +3197,10 @@ def aggregate_host_readiness(
 ) -> str:
     values = [str(values.get(field_name, "unknown")) for values in host_readiness.values()]
     if any(value not in READINESS_VALUES for value in values):
-        raise BootstrapError(f"非法 host readiness 字段：{field_name}")
+        raise BootstrapError(
+            f"非法 host readiness 字段：{field_name}",
+            f"Invalid host readiness field: {field_name}",
+        )
     if not values or "unknown" in values:
         return "unknown"
     if "pending" in values:
@@ -2855,7 +3254,10 @@ def state_payload(
                     }
         for host, values in outcome.host_readiness.items():
             if host not in ACTIVE_HARNESSES:
-                raise BootstrapError(f"非法 outcome host readiness：{host}")
+                raise BootstrapError(
+                    f"非法 outcome host readiness：{host}",
+                    f"Invalid outcome host readiness: {host}",
+                )
             target = merged.setdefault(host, {})
             for key, value in values.items():
                 current = str(value)
@@ -2903,7 +3305,10 @@ def state_payload(
             )
         for key, value in merged.items():
             if value not in READINESS_VALUES:
-                raise BootstrapError(f"非法 state readiness：{key}={value}")
+                raise BootstrapError(
+                    f"非法 state readiness：{key}={value}",
+                    f"Invalid state readiness: {key}={value}",
+                )
         return merged
 
     prior_harnesses = (
@@ -3036,16 +3441,23 @@ def validate_integration_consistency(
         if recorded and recorded != integration:
             raise BootstrapError(
                 f"项目已记录 {framework}/{recorded}，拒绝叠加 {integration}。"
-                "请先人工卸载旧集成并移走状态文件。"
+                "请先人工卸载旧集成并移走状态文件。",
+                f"The project already records {framework}/{recorded}; "
+                f"refusing to stack {integration} on top. Manually uninstall "
+                "the previous integration and move the state file first.",
             )
     managed = detect_managed_instruction_frameworks(root) | detect_frameworks_from_lock(root)
     if integration == "official" and framework in managed:
         raise BootstrapError(
-            f"检测到 {framework} 的项目 Skills 集成，拒绝再安装官方插件版。"
+            f"检测到 {framework} 的项目 Skills 集成，拒绝再安装官方插件版。",
+            f"Detected the project-Skills integration for {framework}; "
+            "refusing to also install the official plugin variant.",
         )
     if integration == "project-skills" and framework in detected_codex_plugins:
         raise BootstrapError(
-            f"检测到已安装的 Codex {framework} 官方插件，拒绝再安装项目 Skills 版。"
+            f"检测到已安装的 Codex {framework} 官方插件，拒绝再安装项目 Skills 版。",
+            f"Detected an installed official Codex {framework} plugin; "
+            "refusing to also install the project-Skills variant.",
         )
 
 
@@ -3151,11 +3563,22 @@ def ensure_no_framework_conflicts(
             if legacy
             else ""
         )
+        suffix_en = (
+            " That set includes a removed legacy framework; uninstall or "
+            "migrate it the official way first."
+            if legacy
+            else ""
+        )
         raise BootstrapError(
             "检测到其他框架："
             + ", ".join(sorted(conflicts))
             + "。本工具不会自动删除或混用；请先人工处理后重试。"
-            + suffix
+            + suffix,
+            "Detected other frameworks: "
+            + ", ".join(sorted(conflicts))
+            + ". This tool never removes or mixes them automatically; "
+            "resolve them manually and retry."
+            + suffix_en,
         )
 
     existing = detect_existing_frameworks(root, repair=repair)
@@ -3341,11 +3764,7 @@ def doctor_project(
             ensure_safe_path(root, lock_path, for_write=False)
         except BootstrapError as exc:
             print(
-                localized_text(
-                    language,
-                    f"诊断失败：{exc}",
-                    f"Doctor failed: {exc}",
-                )
+                doctor_failure(exc, language)
             )
             return 1
         print(
@@ -3362,32 +3781,31 @@ def doctor_project(
         state = load_state(root)
     except BootstrapError as exc:
         print(
-            localized_text(
-                language,
-                f"诊断失败：{exc}",
-                f"Doctor failed: {exc}",
-            )
+            doctor_failure(exc, language)
         )
         return 1
     if not state:
         try:
             detected_set = detect_existing_frameworks(root)
-            if shutil.which("codex"):
+        except BootstrapError as exc:
+            print(
+                doctor_failure(exc, language)
+            )
+            return 1
+        # Keep the plugin inventory fail-closed: a failed query never proves
+        # absence. Record the cause instead of discarding it, so the report
+        # can say why the answer is incomplete.
+        plugin_error: BootstrapError | None = None
+        if shutil.which("codex"):
+            try:
                 detected_set.update(
                     detect_codex_plugin_frameworks(
                         root, dry_run=False, timeout=timeout
                     )
                 )
-            detected = sorted(detected_set)
-        except BootstrapError as exc:
-            print(
-                localized_text(
-                    language,
-                    f"诊断失败：{exc}",
-                    f"Doctor failed: {exc}",
-                )
-            )
-            return 1
+            except BootstrapError as exc:
+                plugin_error = exc
+        detected = sorted(detected_set)
         if detected:
             print(
                 localized_text(
@@ -3399,12 +3817,34 @@ def doctor_project(
                     + ", ".join(detected),
                 )
             )
-        else:
+        elif plugin_error is None:
             print(
                 localized_text(
                     language,
                     "诊断：未找到 Agent Compass 状态或已知框架。",
                     "Doctor: no Agent Compass state or known framework was found.",
+                )
+            )
+        else:
+            print(
+                localized_text(
+                    language,
+                    "诊断：未找到 Agent Compass 状态；文件系统中也没有已知框架。",
+                    "Doctor: no Agent Compass state was found, and no known "
+                    "framework is present on the filesystem.",
+                )
+            )
+        if plugin_error is not None:
+            print(
+                localized_text(
+                    language,
+                    "诊断未完成：无法读取 Codex 插件清单，因此无法排除以插件形式"
+                    "安装的框架。原因：\n"
+                    + bootstrap_error_text(plugin_error, "zh"),
+                    "Doctor incomplete: could not read the Codex plugin "
+                    "inventory, so a framework installed as a plugin cannot "
+                    "be ruled out. Cause:\n"
+                    + bootstrap_error_text(plugin_error, "en"),
                 )
             )
         return 1
@@ -3415,11 +3855,7 @@ def doctor_project(
         )
     except BootstrapError as exc:
         print(
-            localized_text(
-                language,
-                f"诊断失败：{exc}",
-                f"Doctor failed: {exc}",
-            )
+            doctor_failure(exc, language)
         )
         return 1
 
@@ -3466,11 +3902,7 @@ def doctor_project(
         )
     except BootstrapError as exc:
         print(
-            localized_text(
-                language,
-                f"诊断失败：{exc}",
-                f"Doctor failed: {exc}",
-            )
+            doctor_failure(exc, language)
         )
         return 1
 
@@ -3505,11 +3937,7 @@ def doctor_project(
         )
     except BootstrapError as exc:
         print(
-            localized_text(
-                language,
-                f"诊断失败：{exc}",
-                f"Doctor failed: {exc}",
-            )
+            doctor_failure(exc, language)
         )
         return 1
 
@@ -3972,9 +4400,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def requested_language_from_argv(argv: Sequence[str]) -> str:
+    """Recover --language before argparse runs.
+
+    The top-level handler reports failures raised before or outside main's
+    parsed arguments, so the language has to come straight from argv.
+    """
+    for index, item in enumerate(argv):
+        if item.startswith("--language="):
+            return detect_prompt_language(item.split("=", 1)[1])
+        if item == "--language" and index + 1 < len(argv):
+            return detect_prompt_language(argv[index + 1])
+    return detect_prompt_language("auto")
+
+
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except BootstrapError as exc:
-        print(f"错误：{exc}", file=sys.stderr)
+        error_language = requested_language_from_argv(sys.argv[1:])
+        print(
+            localized_text(error_language, "错误：", "Error: ")
+            + bootstrap_error_text(exc, error_language),
+            file=sys.stderr,
+        )
         raise SystemExit(2)

@@ -1808,5 +1808,196 @@ class NamingTests(unittest.TestCase):
                 module.reject_retired_name_traces(root)
 
 
+class ErrorLocalizationTests(unittest.TestCase):
+    def test_explicit_english_variant_is_used(self):
+        exc = module.BootstrapError("中文消息。", "English message.")
+        self.assertEqual(module.bootstrap_error_text(exc, "en"), "English message.")
+        self.assertEqual(module.bootstrap_error_text(exc, "zh"), "中文消息。")
+
+    def test_static_message_falls_back_to_translation_table(self):
+        exc = module.BootstrapError("--timeout 必须大于 0。")
+        self.assertEqual(
+            module.bootstrap_error_text(exc, "en"),
+            "--timeout must be greater than 0.",
+        )
+
+    def test_untranslated_message_falls_back_to_chinese(self):
+        exc = module.BootstrapError("未收录的消息。")
+        self.assertEqual(module.bootstrap_error_text(exc, "en"), "未收录的消息。")
+
+    def test_str_still_returns_chinese_for_existing_callers(self):
+        exc = module.BootstrapError("中文消息。", "English message.")
+        self.assertEqual(str(exc), "中文消息。")
+
+    def test_doctor_failure_prefix_follows_language(self):
+        exc = module.BootstrapError("中文消息。", "English message.")
+        self.assertEqual(
+            module.doctor_failure(exc, "en"), "Doctor failed: English message."
+        )
+        self.assertEqual(module.doctor_failure(exc, "zh"), "诊断失败：中文消息。")
+
+    def test_requested_language_from_argv(self):
+        self.assertEqual(
+            module.requested_language_from_argv(["--doctor", "--language", "en"]),
+            "en",
+        )
+        self.assertEqual(
+            module.requested_language_from_argv(["--language=zh"]), "zh"
+        )
+
+    def test_every_doctor_reachable_error_is_localizable(self):
+        """Guard the documented promise that doctor output follows --language.
+
+        Any BootstrapError reachable from doctor_project must carry an
+        explicit English variant or a translation-table entry, otherwise
+        `--language en` would emit Chinese again.
+        """
+        import ast
+
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+        functions: dict[str, list] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                functions.setdefault(node.name, []).append(node)
+
+        def called_names(node):
+            names = set()
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call):
+                    func = inner.func
+                    if isinstance(func, ast.Name):
+                        names.add(func.id)
+                    elif isinstance(func, ast.Attribute):
+                        names.add(func.attr)
+            return names
+
+        reachable: set[str] = set()
+        pending = ["doctor_project"]
+        while pending:
+            current = pending.pop()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            for node in functions.get(current, []):
+                pending.extend(
+                    name
+                    for name in called_names(node)
+                    if name in functions and name not in reachable
+                )
+
+        untranslated = []
+        for name in reachable:
+            for node in functions.get(name, []):
+                for inner in ast.walk(node):
+                    if not isinstance(inner, ast.Raise):
+                        continue
+                    call = inner.exc
+                    if not isinstance(call, ast.Call):
+                        continue
+                    if getattr(call.func, "id", None) != "BootstrapError":
+                        continue
+                    if len(call.args) >= 2:
+                        continue
+                    first = call.args[0] if call.args else None
+                    if (
+                        isinstance(first, ast.Constant)
+                        and first.value in module.ERROR_MESSAGE_ENGLISH
+                    ):
+                        continue
+                    untranslated.append(f"{name}:{inner.lineno}")
+
+        self.assertEqual(untranslated, [], f"untranslated: {sorted(untranslated)}")
+
+
+class CommandFailureDetailTests(unittest.TestCase):
+    def test_prefers_stderr(self):
+        self.assertEqual(
+            module.command_failure_detail("out\n", "boom\n"), "boom"
+        )
+
+    def test_falls_back_to_stdout_when_stderr_empty(self):
+        self.assertEqual(module.command_failure_detail("boom\n", "  \n"), "boom")
+
+    def test_returns_empty_when_both_streams_empty(self):
+        self.assertEqual(module.command_failure_detail("", ""), "")
+
+    def test_keeps_only_the_tail(self):
+        source = "\n".join(f"line{i}" for i in range(20))
+        detail = module.command_failure_detail("", source)
+        self.assertEqual(
+            detail.splitlines(),
+            [f"line{i}" for i in range(15, 20)],
+        )
+
+    def test_caps_total_length(self):
+        detail = module.command_failure_detail("", "x" * 5000)
+        self.assertLessEqual(len(detail), module.COMMAND_DETAIL_MAX_CHARS)
+
+    def test_failed_command_error_carries_output(self):
+        with TempRepo() as root:
+            with self.assertRaises(module.BootstrapError) as caught:
+                module.run(
+                    (sys.executable, "-c", "import sys; sys.exit(3)"),
+                    cwd=root,
+                    dry_run=False,
+                    timeout=30,
+                )
+            self.assertIn("退出码 3", str(caught.exception))
+
+    def test_failed_command_error_surfaces_stderr_in_both_languages(self):
+        with TempRepo() as root:
+            script = "import sys; sys.stderr.write('root cause here\\n'); sys.exit(1)"
+            with self.assertRaises(module.BootstrapError) as caught:
+                module.run(
+                    (sys.executable, "-c", script),
+                    cwd=root,
+                    dry_run=False,
+                    timeout=30,
+                    echo_output=False,
+                )
+            exc = caught.exception
+            self.assertIn("root cause here", module.bootstrap_error_text(exc, "zh"))
+            detail_en = module.bootstrap_error_text(exc, "en")
+            self.assertIn("root cause here", detail_en)
+            self.assertIn("Command failed", detail_en)
+
+
+class DoctorPluginInventoryTests(unittest.TestCase):
+    def test_failed_plugin_inventory_reports_cause_without_claiming_absence(self):
+        with TempRepo() as root:
+            failure = module.BootstrapError(
+                "命令失败：codex plugin list\n配置文件损坏",
+                "Command failed: codex plugin list\nbroken config file",
+            )
+            output = io.StringIO()
+            with mock.patch.object(
+                module.shutil, "which", return_value="/usr/bin/codex"
+            ), mock.patch.object(
+                module, "detect_codex_plugin_frameworks", side_effect=failure
+            ), contextlib.redirect_stdout(output):
+                rc = module.doctor_project(root, timeout=10, language="en")
+            text = output.getvalue()
+            self.assertEqual(rc, 1)
+            # Fail closed: never assert the repository is clean.
+            self.assertNotIn("no Agent Compass state or known framework", text)
+            self.assertIn("Doctor incomplete", text)
+            self.assertIn("cannot be ruled out", text)
+            self.assertIn("broken config file", text)
+
+    def test_plugin_inventory_success_still_reports_clean_repository(self):
+        with TempRepo() as root:
+            output = io.StringIO()
+            with mock.patch.object(
+                module.shutil, "which", return_value="/usr/bin/codex"
+            ), mock.patch.object(
+                module, "detect_codex_plugin_frameworks", return_value=set()
+            ), contextlib.redirect_stdout(output):
+                rc = module.doctor_project(root, timeout=10, language="en")
+            text = output.getvalue()
+            self.assertEqual(rc, 1)
+            self.assertIn("no Agent Compass state", text)
+            self.assertNotIn("Doctor incomplete", text)
+
+
 if __name__ == "__main__":
     unittest.main()
