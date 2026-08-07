@@ -151,7 +151,7 @@ python3 skills/agent-compass/scripts/compass_bootstrap.py \
 
 The command returns 0 only for a structurally valid, conflict-free, recorded `ready` setup whose current artifacts, checksums, plugin identities, and managed rules match state. Missing or legacy state, a repository lock, mixed frameworks, tampering, incomplete gates, or failed verification return 1. `--language` is the only non-diagnostic behavior option accepted with `--doctor`; it changes output language but never state.
 
-Every error on the diagnosis path follows `--language`, including the embedded failure cause. When a downstream command fails, the error carries the tail of that command's own output, so the root cause is not swallowed.
+Every error the bootstrapper raises follows `--language`, including the embedded failure cause, on both the diagnosis and installation paths. When a downstream command fails, the error carries the tail of that command's own output, so the root cause is not swallowed. A test enforces this: a raise site added without an English variant fails the suite.
 
 A failed Codex plugin inventory stays fail-closed: the diagnosis never claims the repository is clean. It reports that a framework installed as a plugin cannot be ruled out, includes the cause, and still returns 1.
 

@@ -15,6 +15,7 @@ Agent Compass is a reusable coding-agent Skill. Its runtime is the Python 3.10+ 
 
 - Allow exactly one primary framework: Matt Skills, OpenSpec, Trellis, or Superpowers.
 - Never report `ready` until every machine-verifiable and required user-confirmed gate passes.
+- Raise every `BootstrapError` with an English variant, or add its static message to `ERROR_MESSAGE_ENGLISH`; a regression test enforces this. Keep the failing command's output tail in command errors.
 - Keep `--doctor` read-only and `--dry-run` non-mutating with status `not_installed`.
 - Preserve symlink/path-escape rejection, atomic managed writes, repository locking, the post-lock conflict check, and fail-closed plugin detection.
 - Pin npm packages to exact semver and source installs to exact revisions; only `superpowers@openai-curated` is the official Codex integration.

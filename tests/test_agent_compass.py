@@ -1845,68 +1845,63 @@ class ErrorLocalizationTests(unittest.TestCase):
             module.requested_language_from_argv(["--language=zh"]), "zh"
         )
 
-    def test_every_doctor_reachable_error_is_localizable(self):
-        """Guard the documented promise that doctor output follows --language.
+    def test_every_error_is_localizable(self):
+        """Guard the documented promise that output follows --language.
 
-        Any BootstrapError reachable from doctor_project must carry an
-        explicit English variant or a translation-table entry, otherwise
-        `--language en` would emit Chinese again.
+        Every BootstrapError must carry an explicit English variant or a
+        translation-table entry. Without this, a new raise site silently
+        reintroduces Chinese text into `--language en` output.
         """
         import ast
 
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-        functions: dict[str, list] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                functions.setdefault(node.name, []).append(node)
-
-        def called_names(node):
-            names = set()
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Call):
-                    func = inner.func
-                    if isinstance(func, ast.Name):
-                        names.add(func.id)
-                    elif isinstance(func, ast.Attribute):
-                        names.add(func.attr)
-            return names
-
-        reachable: set[str] = set()
-        pending = ["doctor_project"]
-        while pending:
-            current = pending.pop()
-            if current in reachable:
-                continue
-            reachable.add(current)
-            for node in functions.get(current, []):
-                pending.extend(
-                    name
-                    for name in called_names(node)
-                    if name in functions and name not in reachable
-                )
-
         untranslated = []
-        for name in reachable:
-            for node in functions.get(name, []):
-                for inner in ast.walk(node):
-                    if not isinstance(inner, ast.Raise):
-                        continue
-                    call = inner.exc
-                    if not isinstance(call, ast.Call):
-                        continue
-                    if getattr(call.func, "id", None) != "BootstrapError":
-                        continue
-                    if len(call.args) >= 2:
-                        continue
-                    first = call.args[0] if call.args else None
-                    if (
-                        isinstance(first, ast.Constant)
-                        and first.value in module.ERROR_MESSAGE_ENGLISH
-                    ):
-                        continue
-                    untranslated.append(f"{name}:{inner.lineno}")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Raise):
+                continue
+            call = node.exc
+            if not isinstance(call, ast.Call):
+                continue
+            if getattr(call.func, "id", None) != "BootstrapError":
+                continue
+            if len(call.args) >= 2:
+                continue
+            first = call.args[0] if call.args else None
+            if (
+                isinstance(first, ast.Constant)
+                and first.value in module.ERROR_MESSAGE_ENGLISH
+            ):
+                continue
+            untranslated.append(node.lineno)
 
-        self.assertEqual(untranslated, [], f"untranslated: {sorted(untranslated)}")
+        self.assertEqual(
+            untranslated, [], f"untranslated raise sites at lines: {untranslated}"
+        )
+
+    def test_translation_table_has_no_stale_entries(self):
+        """Every table key must still be raised somewhere in the script.
+
+        Compare against AST-resolved constants rather than raw source text,
+        so messages written as implicit string concatenation still match.
+        """
+        import ast
+
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+        raised = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Raise):
+                continue
+            call = node.exc
+            if not isinstance(call, ast.Call):
+                continue
+            if getattr(call.func, "id", None) != "BootstrapError":
+                continue
+            first = call.args[0] if call.args else None
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                raised.add(first.value)
+
+        stale = sorted(set(module.ERROR_MESSAGE_ENGLISH) - raised)
+        self.assertEqual(stale, [], f"stale table entries: {stale}")
 
 
 class CommandFailureDetailTests(unittest.TestCase):

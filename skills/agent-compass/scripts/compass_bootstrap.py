@@ -260,7 +260,10 @@ class ManagedFileTransaction:
         if lstat_exists(path):
             st = path.lstat()
             if not stat.S_ISREG(st.st_mode):
-                raise BootstrapError(f"拒绝修改非普通文件：{path}")
+                raise BootstrapError(
+                    f"拒绝修改非普通文件：{path}",
+                    f"Refusing to modify a non-regular file: {path}",
+                )
             self._snapshots[path] = Snapshot(path, True, path.read_bytes(), stat.S_IMODE(st.st_mode))
         else:
             self._snapshots[path] = Snapshot(path, False, None, None)
@@ -316,10 +319,16 @@ class RepositoryLock:
         except FileExistsError as exc:
             raise BootstrapError(
                 f"检测到 {LOCK_FILE}；另一个 Agent Compass 流程可能正在运行。"
-                "确认没有活动进程后再人工移走陈旧锁文件。"
+                "确认没有活动进程后再人工移走陈旧锁文件。",
+                f"Found {LOCK_FILE}; another Agent Compass process may be "
+                "running. Confirm no process is active before removing a "
+                "stale lock file by hand.",
             ) from exc
         except OSError as exc:
-            raise BootstrapError(f"无法创建仓库锁 {LOCK_FILE}：{exc}") from exc
+            raise BootstrapError(
+                f"无法创建仓库锁 {LOCK_FILE}：{exc}",
+                f"Could not create the repository lock {LOCK_FILE}: {exc}",
+            ) from exc
         lock_stat = os.fstat(fd)
         self._identity = (lock_stat.st_dev, lock_stat.st_ino)
         try:
@@ -1079,7 +1088,10 @@ def normalize_harnesses(
         raise BootstrapError("--harness auto 不能和其他 Agent 同时使用。")
     invalid = sorted(set(values) - set(HARNESSES))
     if invalid:
-        raise BootstrapError("不支持的 Agent：" + ", ".join(invalid))
+        raise BootstrapError(
+            "不支持的 Agent：" + ", ".join(invalid),
+            "Unsupported Agent: " + ", ".join(invalid),
+        )
     return list(dict.fromkeys(values))
 
 
@@ -1272,7 +1284,10 @@ def reject_retired_name_traces(root: Path) -> None:
         ensure_safe_path(root, retired_state, for_write=False)
         raise BootstrapError(
             f"检测到已废弃的 {RETIRED_STATE_FILE}。旧版名称不再受支持；"
-            "请先人工确认旧安装状态并移走该文件，再使用 /agent-compass。"
+            "请先人工确认旧安装状态并移走该文件，再使用 /agent-compass。",
+            f"Found the retired {RETIRED_STATE_FILE}. The old name is no "
+            "longer supported; confirm the previous installation state and "
+            "move that file away before using /agent-compass.",
         )
 
     for relative in (Path("AGENTS.md"), Path("CLAUDE.md")):
@@ -1282,7 +1297,10 @@ def reject_retired_name_traces(root: Path) -> None:
         if RETIRED_MANAGED_PREFIX in safe_read_text(root, path):
             raise BootstrapError(
                 f"{relative} 中存在旧版托管区块。旧版名称已废弃；"
-                "请先人工清理或迁移，再使用 /agent-compass。"
+                "请先人工清理或迁移，再使用 /agent-compass。",
+                f"{relative} contains a legacy managed block. The old name is "
+                "retired; clean it up or migrate it manually before using "
+                "/agent-compass.",
             )
 
     retired_skill_paths = {
@@ -1299,7 +1317,10 @@ def reject_retired_name_traces(root: Path) -> None:
         ensure_safe_path(root, path, for_write=False)
         raise BootstrapError(
             f"检测到旧版 Skill 目录：{path.relative_to(root)}。"
-            "旧版名称已废弃，请先移除旧 Skill，再安装 agent-compass。"
+            "旧版名称已废弃，请先移除旧 Skill，再安装 agent-compass。",
+            f"Found a legacy Skill directory: {path.relative_to(root)}. The "
+            "old name is retired; remove the old Skill before installing "
+            "agent-compass.",
         )
 
 
@@ -1736,7 +1757,11 @@ def write_managed_instruction(
         ensure_safe_path(root, path, for_write=True)
         current = safe_read_text(root, path) if lstat_exists(path) else ""
         if MANAGED_START_PREFIX in current and MANAGED_END not in current:
-            raise BootstrapError(f"{path.name} 中存在残缺的 Agent Compass 托管区块，拒绝自动覆盖。")
+            raise BootstrapError(
+                f"{path.name} 中存在残缺的 Agent Compass 托管区块，拒绝自动覆盖。",
+                f"{path.name} contains a broken Agent Compass managed block; "
+                "refusing to overwrite it automatically.",
+            )
         if MANAGED_START_PREFIX in current:
             updated = pattern.sub(block, current, count=1)
         else:
@@ -1779,7 +1804,11 @@ def write_minimal_instruction(
         ensure_safe_path(root, path, for_write=True)
         current = safe_read_text(root, path) if lstat_exists(path) else ""
         if MINIMAL_START in current and MINIMAL_END not in current:
-            raise BootstrapError(f"{path.name} 中存在残缺的 minimal 托管区块，拒绝自动覆盖。")
+            raise BootstrapError(
+                f"{path.name} 中存在残缺的 minimal 托管区块，拒绝自动覆盖。",
+                f"{path.name} contains a broken minimal managed block; "
+                "refusing to overwrite it automatically.",
+            )
         if MINIMAL_START in current:
             updated = pattern.sub(block, current, count=1)
         else:
@@ -1828,14 +1857,19 @@ def resolve_npm_version(
     if requested:
         if not EXACT_SEMVER.fullmatch(requested):
             raise BootstrapError(
-                f"npm 版本必须是准确 semver，不能使用 dist-tag 或范围：{requested}"
+                f"npm 版本必须是准确 semver，不能使用 dist-tag 或范围：{requested}",
+                f"The npm version must be exact semver; dist-tags and ranges "
+                f"are not accepted: {requested}",
             )
         return requested
     if dry_run:
         return "<resolved-version>"
     data = run_json(("npm", "view", package, "version", "--json"), cwd=root, dry_run=False, timeout=timeout)
     if not isinstance(data, str) or not EXACT_SEMVER.fullmatch(data.strip()):
-        raise BootstrapError(f"无法解析 {package} 的版本。")
+        raise BootstrapError(
+            f"无法解析 {package} 的版本。",
+            f"Could not resolve a version for {package}.",
+        )
     return data.strip()
 
 
@@ -1854,7 +1888,10 @@ def resolve_repository_head(
         return "<resolved-commit>"
     first = result.stdout.strip().split()
     if not first or not re.fullmatch(r"[0-9a-fA-F]{40}", first[0]):
-        raise BootstrapError(f"无法解析 {source} 的提交哈希。")
+        raise BootstrapError(
+            f"无法解析 {source} 的提交哈希。",
+            f"Could not resolve the commit hash for {source}.",
+        )
     return first[0].lower()
 
 
@@ -1868,7 +1905,10 @@ def pinned_repository_checkout(
 ) -> Iterator[Path]:
     """Yield a temporary checkout whose HEAD is the exact recorded revision."""
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise BootstrapError(f"无法检出非精确提交：{revision}")
+        raise BootstrapError(
+            f"无法检出非精确提交：{revision}",
+            f"Cannot check out a non-exact commit: {revision}",
+        )
     require_executable("git")
     url = f"https://github.com/{source}.git"
     with tempfile.TemporaryDirectory(
@@ -1920,7 +1960,9 @@ def pinned_repository_checkout(
         ).stdout.strip().lower()
         if actual != revision:
             raise BootstrapError(
-                f"上游检出提交不一致：期望 {revision}，实际 {actual}"
+                f"上游检出提交不一致：期望 {revision}，实际 {actual}",
+                f"Upstream checkout commit mismatch: expected {revision}, "
+                f"got {actual}",
             )
         yield checkout
 
@@ -2034,7 +2076,10 @@ def protect_installer_targets(
         ensure_safe_path(root, skill_root, for_write=True)
         if lstat_exists(skill_root):
             if not skill_root.is_dir():
-                raise BootstrapError(f"Skill 根路径不是目录：{skill_root}")
+                raise BootstrapError(
+                    f"Skill 根路径不是目录：{skill_root}",
+                    f"Skill root is not a directory: {skill_root}",
+                )
             reject_symlinks_in_tree(root, skill_root)
         for skill in EXPECTED_SKILLS[framework]:
             ensure_safe_path(root, skill_root / skill, for_write=True)
@@ -2176,7 +2221,10 @@ def install_project_skills(
             "随后运行本脚本 `matt --finalize`。"
         )
     else:
-        raise BootstrapError(f"不支持的项目 Skills 框架：{framework}")
+        raise BootstrapError(
+            f"不支持的项目 Skills 框架：{framework}",
+            f"Unsupported project-Skills framework: {framework}",
+        )
     return outcome
 
 
@@ -2358,7 +2406,11 @@ def install_trellis(
         outcome.verification[name] = ok
         if not ok:
             kind = "目录" if expect_directory else "文件"
-            raise BootstrapError(f"Trellis 初始化后缺少预期{kind}：{name}")
+            raise BootstrapError(
+                f"Trellis 初始化后缺少预期{kind}：{name}",
+                f"Expected {kind} missing after Trellis initialization: "
+                f"{name}",
+            )
         outcome.checksums[name] = hash_verified_path(
             root, path, expect_directory=expect_directory
         )
@@ -2508,7 +2560,11 @@ def install_openspec(
         ok = dry_run or verify_path_kind(root, root / relative, expect_directory=True)
         outcome.verification[str(relative) + "/"] = ok
         if not ok:
-            raise BootstrapError(f"OpenSpec 初始化后缺少目录：{relative}")
+            raise BootstrapError(
+                f"OpenSpec 初始化后缺少目录：{relative}",
+                f"Directory missing after OpenSpec initialization: "
+                f"{relative}",
+            )
         outcome.created_or_managed.append(str(relative) + "/")
     verification, checksums, created = verify_openspec_skills(
         root, harnesses, dry_run=dry_run
@@ -2696,7 +2752,10 @@ def install_codex_plugin(
     plugin_inventory: Any | None = None,
 ) -> InstallOutcome:
     if framework != "superpowers":
-        raise BootstrapError(f"不支持的 Codex 官方插件：{framework}")
+        raise BootstrapError(
+            f"不支持的 Codex 官方插件：{framework}",
+            f"Unsupported official Codex plugin: {framework}",
+        )
     require_executable("codex")
     outcome = InstallOutcome(framework=framework, integration="official")
 
@@ -2733,7 +2792,10 @@ def install_codex_plugin(
     if installed_entry and not bool(installed_entry.get("enabled", True)):
         raise BootstrapError(
             f"Codex Superpowers 插件 {plugin_spec_value} 已安装但未启用；"
-            "请先在 Codex 中重新启用，或显式移除后再重试。"
+            "请先在 Codex 中重新启用，或显式移除后再重试。",
+            f"The Codex Superpowers plugin {plugin_spec_value} is installed "
+            "but not enabled; re-enable it in Codex, or remove it explicitly "
+            "and retry.",
         )
     if not installed_entry:
         mutation_tracker.mark(dry_run=dry_run)
@@ -2938,7 +3000,10 @@ def install_framework(
             mutation_tracker=mutation_tracker,
         )
     if framework != "superpowers":
-        raise BootstrapError(f"不支持的框架：{framework}")
+        raise BootstrapError(
+            f"不支持的框架：{framework}",
+            f"Unsupported framework: {framework}",
+        )
 
     if integration == "project-skills":
         return install_project_skills(
@@ -2951,7 +3016,10 @@ def install_framework(
             mutation_tracker=mutation_tracker,
         )
     if integration != "official":
-        raise BootstrapError(f"不支持的集成方式：{integration}")
+        raise BootstrapError(
+            f"不支持的集成方式：{integration}",
+            f"Unsupported integration mode: {integration}",
+        )
     return install_superpowers_official(
         root,
         harnesses,
@@ -4187,7 +4255,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         framework in {"trellis", "openspec"}
         and args.integration == "project-skills"
     ):
-        raise BootstrapError(f"{framework} 只支持 official 集成。")
+        raise BootstrapError(
+            f"{framework} 只支持 official 集成。",
+            f"{framework} supports only the official integration.",
+        )
     if framework == "matt" and args.integration == "official":
         raise BootstrapError(
             "Matt 在本选择器中使用可编辑、可验证的 project-skills 模式。"
