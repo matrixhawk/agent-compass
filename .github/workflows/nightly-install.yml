@@ -1,0 +1,128 @@
+# Real-installation smoke test.
+#
+# The unit suite in ci.yml mocks every external installer, so npm version
+# resolution, the upstream CLI's real output, and post-install verification
+# are never exercised against the network. This job runs one framework
+# end-to-end so upstream drift surfaces here instead of in a user's repo.
+#
+# Scope: OpenSpec only. It is the framework whose `ready` phase is fully
+# machine-verifiable, so the end-to-end assertion is unambiguous.
+#   - Trellis intentionally stops at activation_pending, so `--doctor` returns
+#     1 by design; asserting doctor==0 there would be permanently red.
+#   - The Codex plugin path (Superpowers official) needs the codex CLI, which
+#     is not available on GitHub runners, so it is out of scope here.
+#
+# This job talks to the public npm registry and can fail for reasons outside
+# this repository. That is the point: it is a drift detector, not a gate on
+# pull requests.
+
+name: Nightly install smoke
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  openspec-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # install_openspec calls ensure_node_20, which requires node >= 20.19
+      # and the node, npm, and npx executables.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Create a scratch repository
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/smoke"
+          cd "${RUNNER_TEMP}/smoke"
+          git init -q .
+
+      - name: Install OpenSpec for real
+        run: |
+          set -euo pipefail
+          python3 "${GITHUB_WORKSPACE}/skills/agent-compass/scripts/compass_bootstrap.py" \
+            openspec \
+            --project-root "${RUNNER_TEMP}/smoke" \
+            --harness claude-code \
+            --yes \
+            --language en
+
+      - name: Doctor must report ready
+        run: |
+          set -euo pipefail
+          python3 "${GITHUB_WORKSPACE}/skills/agent-compass/scripts/compass_bootstrap.py" \
+            --project-root "${RUNNER_TEMP}/smoke" \
+            --doctor \
+            --language en
+
+      - name: Recorded state must be schema 7 and ready
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "smoke", ".agent-compass.json")
+          with open(path, encoding="utf-8") as handle:
+              state = json.load(handle)
+
+          problems = []
+          if state.get("schema") != 7:
+              problems.append(f"schema={state.get('schema')!r}, expected 7")
+
+          if state.get("framework") != "openspec":
+              problems.append(f"framework={state.get('framework')!r}")
+          if state.get("status") != "ready":
+              problems.append(f"status={state.get('status')!r}")
+          if not state.get("versions", {}).get("openspec"):
+              problems.append("no resolved openspec version recorded")
+          if not state.get("checksums"):
+              problems.append("no artifact checksums recorded")
+
+          if problems:
+              print("Unexpected recorded state:", *problems, sep="\n  ")
+              sys.exit(1)
+
+          print("Recorded state OK:", json.dumps(
+              {
+                  "schema": state["schema"],
+                  "framework": state["framework"],
+                  "status": state["status"],
+                  "openspec": state["versions"]["openspec"],
+              },
+              indent=2,
+          ))
+          PY
+
+      - name: Dry run must stay non-mutating
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/dry"
+          cd "${RUNNER_TEMP}/dry"
+          git init -q .
+          python3 "${GITHUB_WORKSPACE}/skills/agent-compass/scripts/compass_bootstrap.py" \
+            openspec \
+            --project-root "${RUNNER_TEMP}/dry" \
+            --harness claude-code \
+            --yes \
+            --dry-run \
+            --language en
+          if [ -e "${RUNNER_TEMP}/dry/.agent-compass.json" ]; then
+            echo "Dry run wrote state; it must never do that." >&2
+            exit 1
+          fi

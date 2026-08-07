@@ -1222,10 +1222,16 @@ def ensure_node_version(
         if version is None or version < minimum:
             required = f"{minimum[0]}.{minimum[1]}"
             raise BootstrapError(
-                f"需要 Node.js >= {required}，当前为：{result.stdout.strip()}"
+                f"需要 Node.js >= {required}，当前为：{result.stdout.strip()}",
+                f"Node.js >= {required} is required, but found: "
+                f"{result.stdout.strip()}",
             )
     if sys.version_info < (3, 10):
-        raise BootstrapError(f"需要 Python >= 3.10，当前为：{sys.version.split()[0]}")
+        raise BootstrapError(
+            f"需要 Python >= 3.10，当前为：{sys.version.split()[0]}",
+            f"Python >= 3.10 is required, but found: "
+            f"{sys.version.split()[0]}",
+        )
 
 
 def ensure_node_18(root: Path, *, dry_run: bool, timeout: int) -> None:
